@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from loguru import logger
+from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 
 
@@ -157,6 +158,19 @@ def build_training_summary(
     return "\n".join(lines)
 
 
+def reward_margins(reward: pd.DataFrame) -> np.ndarray:
+    reward_values = reward.to_numpy()
+    sorted_rewards = np.sort(reward_values, axis=1)
+    return sorted_rewards[:, -1] - sorted_rewards[:, -2]
+
+
+def build_example_index(train_df: pd.DataFrame, labels: pd.Series, reward: pd.DataFrame) -> pd.DataFrame:
+    examples_df = train_df[["ID", "query"]].copy()
+    examples_df["label"] = labels.values
+    examples_df["margin"] = reward_margins(reward)
+    return examples_df
+
+
 def select_few_shot_examples(
     train_df: pd.DataFrame,
     labels: pd.Series,
@@ -168,13 +182,7 @@ def select_few_shot_examples(
     if shots_per_label <= 0:
         return []
 
-    reward_values = reward.to_numpy()
-    sorted_rewards = np.sort(reward_values, axis=1)
-    margins = sorted_rewards[:, -1] - sorted_rewards[:, -2]
-
-    examples_df = train_df[["ID", "query"]].copy()
-    examples_df["label"] = labels.values
-    examples_df["margin"] = margins
+    examples_df = build_example_index(train_df, labels, reward)
 
     examples: List[Dict[str, str]] = []
     for model_name in model_names:
@@ -187,8 +195,56 @@ def select_few_shot_examples(
                     "id": str(row.ID),
                     "query": truncate_text(row.query, max_example_chars),
                     "label": row.label,
+                    "margin": f"{row.margin:.4f}",
                 }
             )
+    return examples
+
+
+def build_retriever(train_df: pd.DataFrame, max_features: int) -> Tuple[TfidfVectorizer, Any]:
+    vectorizer = TfidfVectorizer(
+        max_features=max_features,
+        min_df=2,
+        ngram_range=(1, 2),
+        lowercase=True,
+        strip_accents="unicode",
+    )
+    train_matrix = vectorizer.fit_transform(train_df["query"])
+    return vectorizer, train_matrix
+
+
+def select_similar_examples(
+    query: str,
+    example_index: pd.DataFrame,
+    vectorizer: TfidfVectorizer,
+    train_matrix: Any,
+    retrieval_shots: int,
+    max_example_chars: int,
+) -> List[Dict[str, str]]:
+    if retrieval_shots <= 0:
+        return []
+
+    query_vector = vectorizer.transform([query])
+    similarities = (train_matrix @ query_vector.T).toarray().ravel()
+    top_k = min(retrieval_shots, len(similarities))
+    if top_k <= 0:
+        return []
+
+    candidate_idx = np.argpartition(-similarities, top_k - 1)[:top_k]
+    candidate_idx = candidate_idx[np.argsort(-similarities[candidate_idx])]
+
+    examples = []
+    for idx in candidate_idx:
+        row = example_index.iloc[int(idx)]
+        examples.append(
+            {
+                "id": str(row.ID),
+                "query": truncate_text(row.query, max_example_chars),
+                "label": row.label,
+                "similarity": f"{similarities[idx]:.4f}",
+                "margin": f"{row.margin:.4f}",
+            }
+        )
     return examples
 
 
@@ -198,9 +254,14 @@ def format_examples(examples: List[Dict[str, str]]) -> str:
 
     blocks = []
     for idx, example in enumerate(examples, start=1):
+        meta = [f"train ID {example['id']}"]
+        if "similarity" in example:
+            meta.append(f"similarity {example['similarity']}")
+        if "margin" in example:
+            meta.append(f"reward margin {example['margin']}")
         blocks.append(
             (
-                f"Example {idx} (train ID {example['id']}):\n"
+                f"Example {idx} ({', '.join(meta)}):\n"
                 f"Query:\n{example['query']}\n"
                 f"Best label: {example['label']}"
             )
@@ -212,7 +273,8 @@ def build_messages(
     query: str,
     model_names: List[str],
     training_summary: str,
-    examples: List[Dict[str, str]],
+    high_confidence_examples: List[Dict[str, str]],
+    similar_examples: List[Dict[str, str]],
     cfg: RewardConfig,
     max_query_chars: int,
 ) -> List[Dict[str, str]]:
@@ -227,10 +289,17 @@ def build_messages(
         f"Allowed labels: {model_list}\n"
         f"Training reward rule: reward = {cfg.alpha} * performance - "
         f"{1.0 - cfg.alpha:.6g} * normalized_cost, with cost_norm={cfg.cost_norm}.\n\n"
+        "Decision policy:\n"
+        "- Do not answer or solve the final query. Only classify which anonymized label should handle it.\n"
+        "- The labels are anonymized; never infer model ability from the label names themselves.\n"
+        "- Retrieved similar examples are the strongest evidence. Prefer labels from examples with high similarity and high reward margin.\n"
+        "- Use high-confidence examples and the training summary only as tie-breakers when similar examples disagree.\n\n"
         "Training summary:\n"
         f"{training_summary}\n\n"
-        "High-confidence training examples:\n"
-        f"{format_examples(examples)}\n\n"
+        "Retrieved similar training examples:\n"
+        f"{format_examples(similar_examples)}\n\n"
+        "Global high-confidence training examples:\n"
+        f"{format_examples(high_confidence_examples)}\n\n"
         "Final query to classify:\n"
         f"{truncate_text(query, max_query_chars)}\n\n"
         "Return exactly one allowed label. Do not include explanation, JSON, or punctuation."
@@ -337,7 +406,8 @@ def predict_one(
     query: str,
     model_names: List[str],
     training_summary: str,
-    examples: List[Dict[str, str]],
+    high_confidence_examples: List[Dict[str, str]],
+    similar_examples: List[Dict[str, str]],
     reward_cfg: RewardConfig,
     api_cfg: ApiConfig,
     fallback_label: str,
@@ -347,7 +417,8 @@ def predict_one(
         query=query,
         model_names=model_names,
         training_summary=training_summary,
-        examples=examples,
+        high_confidence_examples=high_confidence_examples,
+        similar_examples=similar_examples,
         cfg=reward_cfg,
         max_query_chars=max_query_chars,
     )
@@ -418,6 +489,8 @@ def main() -> None:
     parser.add_argument("--retry-sleep", type=float, default=2.0)
     parser.add_argument("--sleep-seconds", type=float, default=0.3)
     parser.add_argument("--shots-per-label", type=int, default=1)
+    parser.add_argument("--retrieval-shots", type=int, default=0)
+    parser.add_argument("--retrieval-max-features", type=int, default=40000)
     parser.add_argument("--max-example-chars", type=int, default=600)
     parser.add_argument("--max-query-chars", type=int, default=4000)
     parser.add_argument("--limit", type=int, default=0)
@@ -467,7 +540,7 @@ def main() -> None:
     fallback_label = reward.mean(axis=0).idxmax()
 
     training_summary = build_training_summary(labels, reward, perf, cost, model_names)
-    examples = select_few_shot_examples(
+    high_confidence_examples = select_few_shot_examples(
         train_df=train_df,
         labels=labels,
         reward=reward,
@@ -475,13 +548,30 @@ def main() -> None:
         shots_per_label=args.shots_per_label,
         max_example_chars=args.max_example_chars,
     )
+    example_index = build_example_index(train_df, labels, reward)
+    retriever = None
+    if args.retrieval_shots > 0:
+        logger.info("Building TF-IDF retriever for {} similar examples", args.retrieval_shots)
+        retriever = build_retriever(train_df, args.retrieval_max_features)
 
     if args.dry_run:
+        similar_examples = []
+        if retriever is not None:
+            vectorizer, train_matrix = retriever
+            similar_examples = select_similar_examples(
+                query=test_df.iloc[0]["query"],
+                example_index=example_index,
+                vectorizer=vectorizer,
+                train_matrix=train_matrix,
+                retrieval_shots=args.retrieval_shots,
+                max_example_chars=args.max_example_chars,
+            )
         messages = build_messages(
             query=test_df.iloc[0]["query"],
             model_names=model_names,
             training_summary=training_summary,
-            examples=examples,
+            high_confidence_examples=high_confidence_examples,
+            similar_examples=similar_examples,
             cfg=reward_cfg,
             max_query_chars=args.max_query_chars,
         )
@@ -521,11 +611,23 @@ def main() -> None:
             preds.append(existing_predictions[row.ID])
             continue
 
+        similar_examples = []
+        if retriever is not None:
+            vectorizer, train_matrix = retriever
+            similar_examples = select_similar_examples(
+                query=row.query,
+                example_index=example_index,
+                vectorizer=vectorizer,
+                train_matrix=train_matrix,
+                retrieval_shots=args.retrieval_shots,
+                max_example_chars=args.max_example_chars,
+            )
         pred, raw_response = predict_one(
             query=row.query,
             model_names=model_names,
             training_summary=training_summary,
-            examples=examples,
+            high_confidence_examples=high_confidence_examples,
+            similar_examples=similar_examples,
             reward_cfg=reward_cfg,
             api_cfg=api_cfg,
             fallback_label=fallback_label,
