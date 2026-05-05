@@ -39,6 +39,10 @@ class ApiConfig:
     retry_sleep: float = 2.0
 
 
+class NonRetryableApiError(RuntimeError):
+    pass
+
+
 def parse_model_names(columns: List[str]) -> List[str]:
     models = []
     for col in columns:
@@ -96,6 +100,33 @@ def endpoint_from_base_url(base_url: str) -> str:
     if clean.endswith("/chat/completions"):
         return clean
     return f"{clean}/chat/completions"
+
+
+def models_endpoint_from_base_url(base_url: str) -> str:
+    clean = base_url.rstrip("/")
+    if clean.endswith("/chat/completions"):
+        clean = clean[: -len("/chat/completions")]
+    return f"{clean}/models"
+
+
+def extract_api_error_code(body: str) -> str:
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return ""
+    error = parsed.get("error", {})
+    if isinstance(error, dict):
+        code = error.get("code") or error.get("type")
+        if isinstance(code, str):
+            return code
+    return ""
+
+
+def is_non_retryable_http_error(exc: urllib.error.HTTPError, body: str) -> bool:
+    code = extract_api_error_code(body)
+    if code in {"model_not_found", "invalid_api_key", "invalid_request_error"}:
+        return True
+    return exc.code in {400, 401, 403, 404}
 
 
 def truncate_text(text: str, max_chars: int) -> str:
@@ -271,6 +302,37 @@ def call_chat_completion(messages: List[Dict[str, str]], cfg: ApiConfig) -> str:
     raise RuntimeError(f"Could not read completion content: {raw[:500]}")
 
 
+def list_available_models(api_key: str, base_url: str, timeout: float) -> List[str]:
+    endpoint = models_endpoint_from_base_url(base_url)
+    request = urllib.request.Request(
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8")
+
+    parsed = json.loads(raw)
+    data = parsed.get("data", parsed)
+    if isinstance(data, dict):
+        data = data.get("models", [])
+
+    models = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                models.append(item)
+            elif isinstance(item, dict):
+                model_id = item.get("id") or item.get("model") or item.get("name")
+                if isinstance(model_id, str):
+                    models.append(model_id)
+    return sorted(set(models))
+
+
 def predict_one(
     query: str,
     model_names: List[str],
@@ -306,6 +368,10 @@ def predict_one(
                     body = exc.read().decode("utf-8")[:500]
                 except Exception:
                     body = ""
+                if is_non_retryable_http_error(exc, body):
+                    raise NonRetryableApiError(
+                        f"Non-retryable API error for model {api_cfg.model}: {exc} {body}"
+                    ) from exc
             logger.warning("API call failed on attempt {}: {} {}", attempt + 1, exc, body)
 
         if attempt < api_cfg.retries:
@@ -358,6 +424,7 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--request-log", default="")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--list-models", action="store_true")
     parser.add_argument("--alpha", type=float, default=0.85)
     parser.add_argument(
         "--cost-norm",
@@ -365,6 +432,21 @@ def main() -> None:
         choices=["row-max", "none", "minmax-global", "minmax-per-model", "zscore-global"],
     )
     args = parser.parse_args()
+
+    if args.list_models:
+        api_key = os.getenv(args.api_key_env)
+        if not api_key:
+            raise EnvironmentError(
+                f"Missing API key. Set ${args.api_key_env} before listing models."
+            )
+        models = list_available_models(api_key, args.base_url, args.timeout)
+        print(f"Endpoint: {models_endpoint_from_base_url(args.base_url)}")
+        if not models:
+            print("No models returned by the API.")
+            return
+        for model in models:
+            print(model)
+        return
 
     logger.info("Loading data")
     train_df, test_df = load_data(args.train, args.test)
