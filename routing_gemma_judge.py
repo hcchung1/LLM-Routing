@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from datasets import Dataset, Value
 from loguru import logger
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model, prepare_model_for_kbit_training
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
@@ -255,6 +255,9 @@ def main() -> None:
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--score-only", action="store_true")
+    parser.add_argument("--score-batch", type=int, default=1)
+    parser.add_argument("--adapter-path", default=None)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -291,32 +294,35 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    logger.info("Building train/val datasets")
-    train_rows = []
-    for row in tqdm(train_split.itertuples(index=False), total=len(train_split), desc="Train rows"):
-        train_rows.append(
-            build_causal_example(
-                row.query,
-                row.label,
-                tokenizer,
-                max_length=args.max_length,
-                model_names=models,
+    train_ds = None
+    val_ds = None
+    if not args.score_only:
+        logger.info("Building train/val datasets")
+        train_rows = []
+        for row in tqdm(train_split.itertuples(index=False), total=len(train_split), desc="Train rows"):
+            train_rows.append(
+                build_causal_example(
+                    row.query,
+                    row.label,
+                    tokenizer,
+                    max_length=args.max_length,
+                    model_names=models,
+                )
             )
-        )
-    val_rows = []
-    for row in tqdm(val_split.itertuples(index=False), total=len(val_split), desc="Val rows"):
-        val_rows.append(
-            build_causal_example(
-                row.query,
-                row.label,
-                tokenizer,
-                max_length=args.max_length,
-                model_names=models,
+        val_rows = []
+        for row in tqdm(val_split.itertuples(index=False), total=len(val_split), desc="Val rows"):
+            val_rows.append(
+                build_causal_example(
+                    row.query,
+                    row.label,
+                    tokenizer,
+                    max_length=args.max_length,
+                    model_names=models,
+                )
             )
-        )
 
-    train_ds = Dataset.from_list(train_rows).with_format("torch")
-    val_ds = Dataset.from_list(val_rows).with_format("torch")
+        train_ds = Dataset.from_list(train_rows).with_format("torch")
+        val_ds = Dataset.from_list(val_rows).with_format("torch")
 
     compute_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     bnb_config = None
@@ -356,6 +362,8 @@ def main() -> None:
         bias="none",
     )
     model = get_peft_model(model, lora_cfg)
+    if args.score_only and args.adapter_path:
+        model = PeftModel.from_pretrained(model, args.adapter_path)
     model.print_trainable_parameters()
 
     use_fp16 = args.fp16 and torch.cuda.is_available()
@@ -384,16 +392,17 @@ def main() -> None:
 
     training_args = TrainingArguments(**training_args_kwargs)
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        data_collator=CausalDataCollator(tokenizer),
-    )
+    if not args.score_only:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            data_collator=CausalDataCollator(tokenizer),
+        )
 
-    logger.info("Training start")
-    trainer.train()
+        logger.info("Training start")
+        trainer.train()
 
     logger.info("Scoring test set")
     label_token_ids = {
@@ -406,9 +415,11 @@ def main() -> None:
     ]
 
     preds = []
-    batch = 4
-    for i in tqdm(range(0, len(test_prompts), batch), desc="Scoring"):
-        batch_prompts = test_prompts[i : i + batch]
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    for i in tqdm(range(0, len(test_prompts), args.score_batch), desc="Scoring"):
+        batch_prompts = test_prompts[i : i + args.score_batch]
         preds.extend(
             score_batch(
                 model,
