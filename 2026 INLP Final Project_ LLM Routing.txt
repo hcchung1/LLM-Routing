@@ -1,0 +1,93 @@
+2026 Spring
+Introduction to Natural Language Processing
+Final Project: LLM Routing
+TA: Yu-Chien Tang
+tommytyc.cs13@nycu.edu.tw
+1
+
+Task introduction
+LLM Routing
+In real-world LLM applications, routing queries to the right model can save massive amounts of compute while maintaining high user satisfaction. 
+For complex reasoning tasks, you might want to route to a highly capable but expensive model. For simple informational queries, a smaller, cheaper model might suffice.
+Given a user query, your router must dynamically select the most appropriate model from a pool of 11 candidate models.
+There is no limit to the method you can use. Feel free to employ any method you prefer to build the router or process the data.
+Requirement
+Upload your submission to Kaggle.
+Submit a report and your source code to E3.
+
+Deadline is 06/26 (Friday) 23:59, no late submission.
+2
+A good router can save your claude code opus 4.6 quota!
+
+Dataset
+A variety of queries and the corresponding performance and cost for 11 different LLMs.
+
+Final Project Dataset
+train.csv
+test.csv
+sample_submission.csv
+3
+source: nvidia
+
+Data introduction
+train.csv: Contains the ID, the text query, and the ground-truth performance (0.0 to 1.0) and cost for each of the 11 candidate models.
+test.csv: Contains only the ID and the text query. You must predict the best model to route to for these queries.
+sample_submission.csv: A sample submission file showing the correct format.
+
+Your task is to build a routing mechanism, whether it's a lightweight machine learning classifier, a similarity-based KNN router, or an LLM-as-a-Judge, to predict the optimal pred_model for each query in the test set.
+4
+
+Kaggle Submission Format
+You are expected to determine which model is the best choice to answer each query in test set, and then upload your routing decision to Kaggle. Note that your routing decision of each query can be different. The submission format should be:
+A 2551*2 .csv file, first row for column name and the last 2550 rows for your routing decision (Model_A or Model_B or … or Model_K)
+First row must match the one shown in the sample_submission.csv. Make sure the order is correct!
+5
+
+Kaggle link (join the kaggle challenge via your E3 email)
+Change the team name into your Team ID (Team_1, Team_13, etc.) and merge the team with your team members.
+Team ID and Team member
+There’ll be a simple baseline and a strong baseline. Beat them to get higher score.
+The scoring metric is Reward_{0.85}. The higher reward the better.
+Check the definition of Reward in the kaggle challenge page.
+You can submit at most 3 times each day and choose 2 of the submissions to be considered for the private leaderboard.
+6
+Kaggle Submission (70%)
+
+Report Submission (30%)
+
+
+
+Answer the following 3 questions :
+Describe how you implement your router, including your choice of packages, router framework, loss functions, hyperparameters, etc.
+How do you balance the performance and cost of your routing decision? Describe the detailed design intuition and motivation of your LLM router.
+Compare all the methods you have tried and use a table to display their respective performances. Which method performed the best, and why?
+
+Please answer the questions in detail to get the full point of each question.
+7
+
+Grading policy
+Kaggle (70%) 
+30% based on the public leaderboard score and 70% based on the private leaderboard score. Both public and private board are the 50% split of test set.
+Basic score :
+Over strong baseline : 55
+Over simple bassline : 40
+Under simple baseline : 25
+Ranking score:	15-(15/N)*(ranking-1), N=numbers of people in the interval
+Report (30%)
+10% for each quesiton
+You will receive 0 points if you do not submit the source code.
+8
+
+E3 Submission
+Submit your source code and report to E3 before 06/26 (Friday) 23:59.
+Choose a team lead to make submission on E3. File format error will cause -5 final project score!
+Format:
+FinalProject_<Team ID>.zip
+source code: FinalProject_<Team ID>.py  or  FinalProject_<Team ID>.ipynb
+report: FinalProject_<Team ID>.pdf 
+Feel free to contact TA Yu-Chien if you have any question about Final Project.
+mail: tommytyc.cs13@nycu.edu.tw
+9
+
+10
+Have Fun !
