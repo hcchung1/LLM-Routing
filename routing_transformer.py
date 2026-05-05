@@ -206,17 +206,6 @@ def main() -> None:
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    logger.info("Loading model")
-    torch_dtype = torch.float32 if precision == "fp32" else None
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name,
-        num_labels=len(models),
-        id2label=id2label,
-        label2id=label2id,
-        use_safetensors=True,
-        torch_dtype=torch_dtype,
-    )
-
     precision = args.precision
     if args.fp16:
         logger.warning("`--fp16` is deprecated; use `--precision fp16` to force.")
@@ -236,6 +225,16 @@ def main() -> None:
         logger.warning("BF16 requested but CUDA is unavailable; falling back to fp32.")
 
     logger.info("Training precision: {}", precision)
+    logger.info("Loading model")
+    torch_dtype = torch.float32 if precision == "fp32" else None
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model_name,
+        num_labels=len(models),
+        id2label=id2label,
+        label2id=label2id,
+        use_safetensors=True,
+        torch_dtype=torch_dtype,
+    )
     ta_kwargs = dict(
         output_dir="./transformer_runs",
         learning_rate=args.lr,
