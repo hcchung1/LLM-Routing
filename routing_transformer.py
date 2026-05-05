@@ -1,5 +1,6 @@
 import argparse
 import inspect
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -168,8 +169,14 @@ def main() -> None:
     )
     train_split, val_split = split_train_val(train_df, args.val_ratio, args.seed)
 
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    if hf_token:
+        logger.info("HF token detected from environment")
+    else:
+        logger.warning("HF token not found; downloads may be rate-limited")
+
     logger.info("Loading tokenizer: {}", args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=hf_token)
 
     logger.info("Tokenizing train split")
     train_tokens = batch_tokenize(
@@ -224,17 +231,38 @@ def main() -> None:
     if precision == "bf16" and not torch.cuda.is_available():
         logger.warning("BF16 requested but CUDA is unavailable; falling back to fp32.")
 
-    logger.info("Training precision: {}", precision)
     logger.info("Loading model")
     torch_dtype = torch.float32 if precision == "fp32" else None
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name,
-        num_labels=len(models),
-        id2label=id2label,
-        label2id=label2id,
-        use_safetensors=True,
-        torch_dtype=torch_dtype,
+    try:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.model_name,
+            num_labels=len(models),
+            id2label=id2label,
+            label2id=label2id,
+            use_safetensors=True,
+            dtype=torch_dtype,
+            token=hf_token,
+        )
+    except TypeError:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.model_name,
+            num_labels=len(models),
+            id2label=id2label,
+            label2id=label2id,
+            use_safetensors=True,
+            torch_dtype=torch_dtype,
+            token=hf_token,
+        )
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(
+        "Model params: total={} ({:.2f}M), trainable={} ({:.2f}M)",
+        total_params,
+        total_params / 1e6,
+        trainable_params,
+        trainable_params / 1e6,
     )
+    logger.info("Training precision: {}", precision)
     ta_kwargs = dict(
         output_dir="./transformer_runs",
         learning_rate=args.lr,
@@ -244,7 +272,6 @@ def main() -> None:
         max_grad_norm=args.max_grad_norm,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
-        logging_steps=50,
         report_to="none",
         seed=args.seed,
         fp16=use_fp16,
@@ -256,6 +283,10 @@ def main() -> None:
         ta_kwargs["eval_strategy"] = "epoch"
     if "save_strategy" in ta_sig.parameters:
         ta_kwargs["save_strategy"] = "epoch"
+    if "logging_strategy" in ta_sig.parameters:
+        ta_kwargs["logging_strategy"] = "epoch"
+    if "logging_steps" in ta_sig.parameters:
+        ta_kwargs["logging_steps"] = 10**9
     if "remove_unused_columns" in ta_sig.parameters:
         ta_kwargs["remove_unused_columns"] = False
     if "label_names" in ta_sig.parameters:

@@ -10,6 +10,8 @@ protobuf>=4.23
 tiktoken>=0.7
 loguru>=0.7
 tqdm>=4.66
+peft>=0.11
+bitsandbytes>=0.43
 
 # CUDA 12.4 (install from PyTorch index)
 # --index-url https://download.pytorch.org/whl/cu124
