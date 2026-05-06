@@ -6,6 +6,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -42,6 +43,9 @@ class ApiConfig:
 
 class NonRetryableApiError(RuntimeError):
     pass
+
+
+ARC_AGI_PATTERN = re.compile(r"^ARC-AGI Task [0-9a-fA-F]+$")
 
 
 def parse_model_names(columns: List[str]) -> List[str]:
@@ -158,6 +162,51 @@ def build_training_summary(
     return "\n".join(lines)
 
 
+def is_arc_agi_id_only(query: str) -> bool:
+    return bool(ARC_AGI_PATTERN.fullmatch(str(query).strip()))
+
+
+def format_counts(counts: Dict[str, int], model_names: List[str], top_n: int = 0) -> str:
+    items = [(model_name, int(counts.get(model_name, 0))) for model_name in model_names]
+    items = [(model_name, count) for model_name, count in items if count > 0]
+    items.sort(key=lambda item: (-item[1], item[0]))
+    if top_n > 0:
+        items = items[:top_n]
+    total = sum(count for _, count in items)
+    if total <= 0:
+        return "none"
+    return ", ".join(
+        f"{model_name}={count} ({count / total:.1%})" for model_name, count in items
+    )
+
+
+def build_arc_agi_prior(labels: pd.Series, train_df: pd.DataFrame, model_names: List[str]) -> Tuple[str, Dict[str, int]]:
+    mask = train_df["query"].astype(str).map(is_arc_agi_id_only)
+    counts = labels[mask].value_counts().to_dict()
+    if not counts:
+        return "", {}
+    majority_label = max(counts.items(), key=lambda item: (item[1], item[0]))[0]
+    context = (
+        "Query family: ARC-AGI Task with only an opaque task ID.\n"
+        f"Family training count: {int(mask.sum())}.\n"
+        f"Family label prior: {format_counts(counts, model_names)}.\n"
+        f"Family prior majority label: {majority_label}.\n"
+        "The hex task ID has no semantic meaning for routing. Do not treat TF-IDF matches "
+        "between different ARC task IDs as strong semantic evidence; use the family prior "
+        "as the main evidence for this query family."
+    )
+    return context, {str(label): int(count) for label, count in counts.items()}
+
+
+def query_family_context(
+    query: str,
+    arc_context: str,
+) -> str:
+    if arc_context and is_arc_agi_id_only(query):
+        return arc_context
+    return "No special query family prior."
+
+
 def reward_margins(reward: pd.DataFrame) -> np.ndarray:
     reward_values = reward.to_numpy()
     sorted_rewards = np.sort(reward_values, axis=1)
@@ -269,12 +318,18 @@ def format_examples(examples: List[Dict[str, str]]) -> str:
     return "\n\n".join(blocks)
 
 
+def format_retrieved_label_counts(examples: List[Dict[str, str]], model_names: List[str]) -> str:
+    counts = Counter(example["label"] for example in examples)
+    return format_counts(dict(counts), model_names)
+
+
 def build_messages(
     query: str,
     model_names: List[str],
     training_summary: str,
     high_confidence_examples: List[Dict[str, str]],
     similar_examples: List[Dict[str, str]],
+    family_context: str,
     cfg: RewardConfig,
     max_query_chars: int,
 ) -> List[Dict[str, str]]:
@@ -292,10 +347,15 @@ def build_messages(
         "Decision policy:\n"
         "- Do not answer or solve the final query. Only classify which anonymized label should handle it.\n"
         "- The labels are anonymized; never infer model ability from the label names themselves.\n"
-        "- Retrieved similar examples are the strongest evidence. Prefer labels from examples with high similarity and high reward margin.\n"
-        "- Use high-confidence examples and the training summary only as tie-breakers when similar examples disagree.\n\n"
+        "- When retrieved examples are genuinely semantic matches, use their label majority as strong evidence.\n"
+        "- Do not let one high-margin outlier overrule the retrieved label majority or a query-family prior.\n"
+        "- Use high-confidence examples and the training summary only as tie-breakers when stronger local evidence is absent.\n\n"
+        "Query family prior:\n"
+        f"{family_context}\n\n"
         "Training summary:\n"
         f"{training_summary}\n\n"
+        "Retrieved label counts:\n"
+        f"{format_retrieved_label_counts(similar_examples, model_names)}\n\n"
         "Retrieved similar training examples:\n"
         f"{format_examples(similar_examples)}\n\n"
         "Global high-confidence training examples:\n"
@@ -408,6 +468,7 @@ def predict_one(
     training_summary: str,
     high_confidence_examples: List[Dict[str, str]],
     similar_examples: List[Dict[str, str]],
+    family_context: str,
     reward_cfg: RewardConfig,
     api_cfg: ApiConfig,
     fallback_label: str,
@@ -419,6 +480,7 @@ def predict_one(
         training_summary=training_summary,
         high_confidence_examples=high_confidence_examples,
         similar_examples=similar_examples,
+        family_context=family_context,
         cfg=reward_cfg,
         max_query_chars=max_query_chars,
     )
@@ -498,6 +560,11 @@ def main() -> None:
     parser.add_argument("--request-log", default="")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--list-models", action="store_true")
+    parser.add_argument(
+        "--arc-agi-prior-override",
+        action="store_true",
+        help="Predict ARC-AGI Task ID-only rows with the ARC training-family majority label without an API call.",
+    )
     parser.add_argument("--alpha", type=float, default=0.85)
     parser.add_argument(
         "--cost-norm",
@@ -538,6 +605,15 @@ def main() -> None:
     reward = compute_reward(perf, cost, reward_cfg)
     labels = build_labels(reward)
     fallback_label = reward.mean(axis=0).idxmax()
+    arc_family_context, arc_family_counts = build_arc_agi_prior(labels, train_df, model_names)
+    arc_majority_label = ""
+    if arc_family_counts:
+        arc_majority_label = max(arc_family_counts.items(), key=lambda item: (item[1], item[0]))[0]
+        logger.info(
+            "ARC-AGI family prior: majority={} counts={}",
+            arc_majority_label,
+            format_counts(arc_family_counts, model_names),
+        )
 
     training_summary = build_training_summary(labels, reward, perf, cost, model_names)
     high_confidence_examples = select_few_shot_examples(
@@ -572,6 +648,7 @@ def main() -> None:
             training_summary=training_summary,
             high_confidence_examples=high_confidence_examples,
             similar_examples=similar_examples,
+            family_context=query_family_context(test_df.iloc[0]["query"], arc_family_context),
             cfg=reward_cfg,
             max_query_chars=args.max_query_chars,
         )
@@ -611,6 +688,21 @@ def main() -> None:
             preds.append(existing_predictions[row.ID])
             continue
 
+        if args.arc_agi_prior_override and arc_majority_label and is_arc_agi_id_only(row.query):
+            pred = arc_majority_label
+            preds.append(pred)
+            append_request_log(
+                args.request_log,
+                {
+                    "ID": row.ID,
+                    "pred_model": pred,
+                    "raw_response": "",
+                    "decision_source": "arc_agi_prior_override",
+                },
+            )
+            make_submission(test_df.iloc[: len(preds)], preds, args.out)
+            continue
+
         similar_examples = []
         if retriever is not None:
             vectorizer, train_matrix = retriever
@@ -628,6 +720,7 @@ def main() -> None:
             training_summary=training_summary,
             high_confidence_examples=high_confidence_examples,
             similar_examples=similar_examples,
+            family_context=query_family_context(row.query, arc_family_context),
             reward_cfg=reward_cfg,
             api_cfg=api_cfg,
             fallback_label=fallback_label,
