@@ -2,16 +2,16 @@ numpy>=1.24
 pandas>=2.0
 scikit-learn>=1.3
 
-transformers>=4.40
+transformers>=4.41
 datasets>=2.18
-accelerate>=0.29
+accelerate>=0.30
 sentencepiece>=0.2
 protobuf>=4.23
 tiktoken>=0.7
 loguru>=0.7
 tqdm>=4.66
 peft>=0.11
-bitsandbytes>=0.43
+bitsandbytes>=0.44.1
 
 # CUDA 12.4 (install from PyTorch index)
 # --index-url https://download.pytorch.org/whl/cu124

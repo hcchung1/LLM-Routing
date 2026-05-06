@@ -7,9 +7,10 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from packaging import version
 from datasets import Dataset, Value
 from loguru import logger
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model, prepare_model_for_kbit_training
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
@@ -18,6 +19,30 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+
+
+def patch_bnb_params4bit() -> None:
+    try:
+        import bitsandbytes as bnb
+        from bitsandbytes.nn import Params4bit
+    except Exception:
+        return
+
+    try:
+        sig = inspect.signature(Params4bit.__new__)
+    except (TypeError, ValueError):
+        return
+
+    if "_is_hf_initialized" in sig.parameters:
+        return
+
+    orig_new = Params4bit.__new__
+
+    def _new(cls, *args, **kwargs):
+        kwargs.pop("_is_hf_initialized", None)
+        return orig_new(cls, *args, **kwargs)
+
+    Params4bit.__new__ = staticmethod(_new)
 
 
 @dataclass
@@ -182,46 +207,49 @@ def score_batch(
     prompt_ids_batch: List[List[int]],
     label_token_ids: Dict[str, List[int]],
     max_length: int,
+    label_batch: int,
 ) -> List[str]:
     model.eval()
     device = next(model.parameters()).device
     labels = list(label_token_ids.keys())
 
-    sequences = []
-    meta = []
-    for q_idx, prompt_ids in enumerate(prompt_ids_batch):
-        for label in labels:
-            label_ids = label_token_ids[label]
-            trunc_prompt = truncate_prompt_ids(prompt_ids, label_ids, max_length)
-            input_ids = trunc_prompt + label_ids
-            sequences.append(input_ids)
-            meta.append((q_idx, label, len(trunc_prompt)))
+    scores = {q_idx: {} for q_idx in range(len(prompt_ids_batch))}
+    for start in range(0, len(labels), label_batch):
+        label_chunk = labels[start : start + label_batch]
+        sequences = []
+        meta = []
+        for q_idx, prompt_ids in enumerate(prompt_ids_batch):
+            for label in label_chunk:
+                label_ids = label_token_ids[label]
+                trunc_prompt = truncate_prompt_ids(prompt_ids, label_ids, max_length)
+                input_ids = trunc_prompt + label_ids
+                sequences.append(input_ids)
+                meta.append((q_idx, label, len(trunc_prompt)))
 
-    max_len = max(len(seq) for seq in sequences)
-    input_ids = []
-    attention_mask = []
-    for seq in sequences:
-        pad_len = max_len - len(seq)
-        input_ids.append(seq + [tokenizer.pad_token_id] * pad_len)
-        attention_mask.append([1] * len(seq) + [0] * pad_len)
+        max_len = max(len(seq) for seq in sequences)
+        input_ids = []
+        attention_mask = []
+        for seq in sequences:
+            pad_len = max_len - len(seq)
+            input_ids.append(seq + [tokenizer.pad_token_id] * pad_len)
+            attention_mask.append([1] * len(seq) + [0] * pad_len)
 
-    input_ids = torch.tensor(input_ids, dtype=torch.long, device=device)
-    attention_mask = torch.tensor(attention_mask, dtype=torch.long, device=device)
+        input_ids = torch.tensor(input_ids, dtype=torch.long, device=device)
+        attention_mask = torch.tensor(attention_mask, dtype=torch.long, device=device)
 
-    with torch.inference_mode():
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        log_probs = torch.log_softmax(logits, dim=-1)
+        with torch.inference_mode():
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            log_probs = torch.log_softmax(logits, dim=-1)
 
-    scores = {}
-    for idx, (q_idx, label, prompt_len) in enumerate(meta):
-        seq = sequences[idx]
-        label_len = len(seq) - prompt_len
-        score = 0.0
-        for pos in range(prompt_len, len(seq)):
-            token_id = seq[pos]
-            score += float(log_probs[idx, pos - 1, token_id].item())
-        score = score / max(1, label_len)
-        scores.setdefault(q_idx, {})[label] = score
+        for idx, (q_idx, label, prompt_len) in enumerate(meta):
+            seq = sequences[idx]
+            label_len = len(seq) - prompt_len
+            score = 0.0
+            for pos in range(prompt_len, len(seq)):
+                token_id = seq[pos]
+                score += float(log_probs[idx, pos - 1, token_id].item())
+            score = score / max(1, label_len)
+            scores[q_idx][label] = score
 
     preds = []
     for q_idx in range(len(prompt_ids_batch)):
@@ -255,6 +283,15 @@ def main() -> None:
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--no-eval", action="store_true")
+    parser.add_argument("--cpu-offload", action="store_true")
+    parser.add_argument("--max-gpu-mem", default=None)
+    parser.add_argument("--offload-folder", default="offload")
+    parser.add_argument("--score-only", action="store_true")
+    parser.add_argument("--score-batch", type=int, default=1)
+    parser.add_argument("--label-batch", type=int, default=1)
+    parser.add_argument("--adapter-path", default=None)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -291,42 +328,51 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    logger.info("Building train/val datasets")
-    train_rows = []
-    for row in tqdm(train_split.itertuples(index=False), total=len(train_split), desc="Train rows"):
-        train_rows.append(
-            build_causal_example(
-                row.query,
-                row.label,
-                tokenizer,
-                max_length=args.max_length,
-                model_names=models,
+    train_ds = None
+    val_ds = None
+    if not args.score_only:
+        logger.info("Building train/val datasets")
+        train_rows = []
+        for row in tqdm(train_split.itertuples(index=False), total=len(train_split), desc="Train rows"):
+            train_rows.append(
+                build_causal_example(
+                    row.query,
+                    row.label,
+                    tokenizer,
+                    max_length=args.max_length,
+                    model_names=models,
+                )
             )
-        )
-    val_rows = []
-    for row in tqdm(val_split.itertuples(index=False), total=len(val_split), desc="Val rows"):
-        val_rows.append(
-            build_causal_example(
-                row.query,
-                row.label,
-                tokenizer,
-                max_length=args.max_length,
-                model_names=models,
-            )
-        )
-
-    train_ds = Dataset.from_list(train_rows).with_format("torch")
-    val_ds = Dataset.from_list(val_rows).with_format("torch")
+        train_ds = Dataset.from_list(train_rows).with_format("torch")
+        if not args.no_eval:
+            val_rows = []
+            for row in tqdm(val_split.itertuples(index=False), total=len(val_split), desc="Val rows"):
+                val_rows.append(
+                    build_causal_example(
+                        row.query,
+                        row.label,
+                        tokenizer,
+                        max_length=args.max_length,
+                        model_names=models,
+                    )
+                )
+            val_ds = Dataset.from_list(val_rows).with_format("torch")
 
     compute_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     bnb_config = None
     if args.load_in_4bit:
+        patch_bnb_params4bit()
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=compute_dtype,
+            llm_int8_enable_fp32_cpu_offload=args.cpu_offload,
         )
+
+    max_memory = None
+    if args.max_gpu_mem:
+        max_memory = {0: args.max_gpu_mem, "cpu": "48GiB"}
 
     logger.info("Loading model")
     model = AutoModelForCausalLM.from_pretrained(
@@ -334,29 +380,38 @@ def main() -> None:
         token=hf_token,
         quantization_config=bnb_config,
         device_map="auto" if torch.cuda.is_available() else None,
+        max_memory=max_memory,
+        offload_folder=args.offload_folder if args.cpu_offload else None,
+        offload_state_dict=args.cpu_offload,
     )
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model)
+    if args.gradient_checkpointing and not args.score_only:
+        model.gradient_checkpointing_enable()
 
-    target_modules = [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ]
-    lora_cfg = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=target_modules,
-        bias="none",
-    )
-    model = get_peft_model(model, lora_cfg)
-    model.print_trainable_parameters()
+    if args.score_only:
+        if args.adapter_path:
+            model = PeftModel.from_pretrained(model, args.adapter_path)
+    else:
+        target_modules = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+        lora_cfg = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+        )
+        model = get_peft_model(model, lora_cfg)
+        model.print_trainable_parameters()
 
     use_fp16 = args.fp16 and torch.cuda.is_available()
     training_args_kwargs = dict(
@@ -377,23 +432,26 @@ def main() -> None:
         remove_unused_columns=False,
     )
     training_args_params = inspect.signature(TrainingArguments).parameters
+    if "gradient_checkpointing" in training_args_params:
+        training_args_kwargs["gradient_checkpointing"] = args.gradient_checkpointing
     if "evaluation_strategy" in training_args_params:
-        training_args_kwargs["evaluation_strategy"] = "epoch"
+        training_args_kwargs["evaluation_strategy"] = "no" if args.no_eval else "epoch"
     elif "eval_strategy" in training_args_params:
-        training_args_kwargs["eval_strategy"] = "epoch"
+        training_args_kwargs["eval_strategy"] = "no" if args.no_eval else "epoch"
 
     training_args = TrainingArguments(**training_args_kwargs)
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        data_collator=CausalDataCollator(tokenizer),
-    )
+    if not args.score_only:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=None if args.no_eval else val_ds,
+            data_collator=CausalDataCollator(tokenizer),
+        )
 
-    logger.info("Training start")
-    trainer.train()
+        logger.info("Training start")
+        trainer.train()
 
     logger.info("Scoring test set")
     label_token_ids = {
@@ -406,9 +464,11 @@ def main() -> None:
     ]
 
     preds = []
-    batch = 4
-    for i in tqdm(range(0, len(test_prompts), batch), desc="Scoring"):
-        batch_prompts = test_prompts[i : i + batch]
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    for i in tqdm(range(0, len(test_prompts), args.score_batch), desc="Scoring"):
+        batch_prompts = test_prompts[i : i + args.score_batch]
         preds.extend(
             score_batch(
                 model,
@@ -416,6 +476,7 @@ def main() -> None:
                 batch_prompts,
                 label_token_ids,
                 max_length=args.max_length,
+                label_batch=args.label_batch,
             )
         )
 
