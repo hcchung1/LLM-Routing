@@ -7,7 +7,6 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from packaging import version
 from datasets import Dataset, Value
 from loguru import logger
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model, prepare_model_for_kbit_training
@@ -278,9 +277,15 @@ def main() -> None:
         choices=["row-max", "none", "minmax-global", "minmax-per-model", "zscore-global"],
     )
     parser.add_argument("--load-in-4bit", action="store_true")
+    parser.add_argument("--load-in-8bit", action="store_true")
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora-target-modules",
+        default=None,
+        help="Comma-separated target module names for LoRA",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
@@ -360,6 +365,8 @@ def main() -> None:
 
     compute_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     bnb_config = None
+    if args.load_in_4bit and args.load_in_8bit:
+        raise ValueError("Choose only one of --load-in-4bit or --load-in-8bit")
     if args.load_in_4bit:
         patch_bnb_params4bit()
         bnb_config = BitsAndBytesConfig(
@@ -367,6 +374,11 @@ def main() -> None:
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=compute_dtype,
+            llm_int8_enable_fp32_cpu_offload=args.cpu_offload,
+        )
+    elif args.load_in_8bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
             llm_int8_enable_fp32_cpu_offload=args.cpu_offload,
         )
 
@@ -393,15 +405,21 @@ def main() -> None:
         if args.adapter_path:
             model = PeftModel.from_pretrained(model, args.adapter_path)
     else:
-        target_modules = [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ]
+        if args.lora_target_modules:
+            target_modules = [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
+        elif args.load_in_4bit or args.load_in_8bit:
+            # Gemma 4 uses wrapper modules around Linear4bit/8bit; target inner Linear modules.
+            target_modules = ["linear"]
+        else:
+            target_modules = [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ]
         lora_cfg = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=args.lora_r,
