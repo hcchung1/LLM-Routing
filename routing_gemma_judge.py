@@ -297,6 +297,7 @@ def main() -> None:
     parser.add_argument("--score-batch", type=int, default=1)
     parser.add_argument("--label-batch", type=int, default=1)
     parser.add_argument("--adapter-path", default=None)
+    parser.add_argument("--num-workers", type=int, default=2)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -448,6 +449,8 @@ def main() -> None:
         seed=args.seed,
         fp16=use_fp16,
         remove_unused_columns=False,
+        dataloader_num_workers=args.num_workers,
+        dataloader_pin_memory=torch.cuda.is_available(),
     )
     training_args_params = inspect.signature(TrainingArguments).parameters
     if "gradient_checkpointing" in training_args_params:
