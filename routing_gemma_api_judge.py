@@ -31,6 +31,7 @@ class RewardConfig:
 
 @dataclass
 class ApiConfig:
+    provider: str
     api_key: str
     base_url: str
     model: str
@@ -39,6 +40,7 @@ class ApiConfig:
     timeout: float = 60.0
     retries: int = 3
     retry_sleep: float = 2.0
+    google_thinking_budget: Optional[int] = 0
 
 
 class NonRetryableApiError(RuntimeError):
@@ -112,6 +114,24 @@ def models_endpoint_from_base_url(base_url: str) -> str:
     if clean.endswith("/chat/completions"):
         clean = clean[: -len("/chat/completions")]
     return f"{clean}/models"
+
+
+def google_generate_endpoint(base_url: str, model: str) -> str:
+    clean = base_url.rstrip("/")
+    if clean.endswith(":generateContent"):
+        return clean
+    return f"{clean}/models/{model}:generateContent"
+
+
+def google_models_endpoint(base_url: str) -> str:
+    clean = base_url.rstrip("/")
+    return f"{clean}/models"
+
+
+def provider_endpoint(provider: str, base_url: str, model: str) -> str:
+    if provider == "google":
+        return google_generate_endpoint(base_url, model)
+    return endpoint_from_base_url(base_url)
 
 
 def extract_api_error_code(body: str) -> str:
@@ -431,6 +451,81 @@ def call_chat_completion(messages: List[Dict[str, str]], cfg: ApiConfig) -> str:
     raise RuntimeError(f"Could not read completion content: {raw[:500]}")
 
 
+def call_google_generate_content(messages: List[Dict[str, str]], cfg: ApiConfig) -> str:
+    endpoint = google_generate_endpoint(cfg.base_url, cfg.model)
+    system_text = "\n\n".join(
+        message["content"] for message in messages if message["role"] == "system"
+    )
+    user_text = "\n\n".join(
+        message["content"] for message in messages if message["role"] != "system"
+    )
+    generation_config: Dict[str, Any] = {
+        "temperature": cfg.temperature,
+        "maxOutputTokens": cfg.max_tokens,
+    }
+    if cfg.google_thinking_budget is not None:
+        generation_config["thinkingConfig"] = {
+            "thinkingBudget": cfg.google_thinking_budget,
+        }
+
+    payload: Dict[str, Any] = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": user_text}],
+            }
+        ],
+        "generationConfig": generation_config,
+    }
+    if system_text:
+        payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=data,
+        headers={
+            "x-goog-api-key": cfg.api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=cfg.timeout) as response:
+        raw = response.read().decode("utf-8")
+
+    parsed = json.loads(raw)
+    candidates = parsed.get("candidates", [])
+    if not candidates:
+        raise RuntimeError(f"Google API response did not include candidates: {raw[:500]}")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    answer_texts = [
+        part.get("text", "")
+        for part in parts
+        if isinstance(part, dict) and not part.get("thought") and part.get("text")
+    ]
+    if answer_texts:
+        return "\n".join(answer_texts).strip()
+
+    fallback_texts = [
+        part.get("text", "")
+        for part in parts
+        if isinstance(part, dict) and part.get("text")
+    ]
+    if fallback_texts:
+        return "\n".join(fallback_texts).strip()
+
+    raise RuntimeError(f"Could not read Google completion content: {raw[:500]}")
+
+
+def call_model(messages: List[Dict[str, str]], cfg: ApiConfig) -> str:
+    if cfg.provider == "google":
+        return call_google_generate_content(messages, cfg)
+    return call_chat_completion(messages, cfg)
+
+
 def list_available_models(api_key: str, base_url: str, timeout: float) -> List[str]:
     endpoint = models_endpoint_from_base_url(base_url)
     request = urllib.request.Request(
@@ -462,6 +557,30 @@ def list_available_models(api_key: str, base_url: str, timeout: float) -> List[s
     return sorted(set(models))
 
 
+def list_google_models(api_key: str, base_url: str, timeout: float) -> List[str]:
+    request = urllib.request.Request(
+        google_models_endpoint(base_url),
+        headers={
+            "x-goog-api-key": api_key,
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8")
+
+    parsed = json.loads(raw)
+    models = []
+    for item in parsed.get("models", []):
+        if not isinstance(item, dict):
+            continue
+        model_name = item.get("name") or item.get("baseModelId")
+        if isinstance(model_name, str):
+            models.append(model_name.removeprefix("models/"))
+    return sorted(set(models))
+
+
 def predict_one(
     query: str,
     model_names: List[str],
@@ -488,7 +607,7 @@ def predict_one(
     last_response = ""
     for attempt in range(api_cfg.retries + 1):
         try:
-            raw_response = call_chat_completion(messages, api_cfg)
+            raw_response = call_model(messages, api_cfg)
             last_response = raw_response
             label = parse_label(raw_response, model_names)
             if label:
@@ -541,11 +660,18 @@ def main() -> None:
     parser.add_argument("--train", default="dataset/train.csv")
     parser.add_argument("--test", default="dataset/test.csv")
     parser.add_argument("--out", default="submission_gemma_api.csv")
-    parser.add_argument("--base-url", default=os.getenv("BANANA_BASE_URL", "https://api.banana2556.com/v1"))
-    parser.add_argument("--model", default=os.getenv("BANANA_MODEL", "google/gemma-3-4b-it"))
-    parser.add_argument("--api-key-env", default="BANANA_API_KEY")
+    parser.add_argument("--provider", default=os.getenv("ROUTING_API_PROVIDER", "openai"), choices=["openai", "google"])
+    parser.add_argument("--base-url", default="")
+    parser.add_argument("--model", default="")
+    parser.add_argument("--api-key-env", default="")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=8)
+    parser.add_argument(
+        "--google-thinking-budget",
+        type=int,
+        default=0,
+        help="Google thinking budget. Use -1 to omit thinkingConfig.",
+    )
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-sleep", type=float, default=2.0)
@@ -573,14 +699,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.provider == "google":
+        args.base_url = args.base_url or os.getenv(
+            "GEMINI_BASE_URL",
+            "https://generativelanguage.googleapis.com/v1beta",
+        )
+        args.model = args.model or os.getenv("GEMINI_MODEL", "gemma-4-31b-it")
+        args.api_key_env = args.api_key_env or "GEMINI_API_KEY"
+    else:
+        args.base_url = args.base_url or os.getenv("BANANA_BASE_URL", "https://api.banana2556.com/v1")
+        args.model = args.model or os.getenv("BANANA_MODEL", "google/gemma-3-4b-it")
+        args.api_key_env = args.api_key_env or "BANANA_API_KEY"
+
     if args.list_models:
         api_key = os.getenv(args.api_key_env)
         if not api_key:
             raise EnvironmentError(
                 f"Missing API key. Set ${args.api_key_env} before listing models."
             )
-        models = list_available_models(api_key, args.base_url, args.timeout)
-        print(f"Endpoint: {models_endpoint_from_base_url(args.base_url)}")
+        if args.provider == "google":
+            models = list_google_models(api_key, args.base_url, args.timeout)
+            print(f"Endpoint: {google_models_endpoint(args.base_url)}")
+        else:
+            models = list_available_models(api_key, args.base_url, args.timeout)
+            print(f"Endpoint: {models_endpoint_from_base_url(args.base_url)}")
         if not models:
             print("No models returned by the API.")
             return
@@ -652,7 +794,8 @@ def main() -> None:
             cfg=reward_cfg,
             max_query_chars=args.max_query_chars,
         )
-        print(f"Endpoint: {endpoint_from_base_url(args.base_url)}")
+        print(f"Provider: {args.provider}")
+        print(f"Endpoint: {provider_endpoint(args.provider, args.base_url, args.model)}")
         print(f"Model: {args.model}")
         print(json.dumps(messages, ensure_ascii=False, indent=2))
         return
@@ -664,6 +807,7 @@ def main() -> None:
         )
 
     api_cfg = ApiConfig(
+        provider=args.provider,
         api_key=api_key,
         base_url=args.base_url,
         model=args.model,
@@ -672,15 +816,17 @@ def main() -> None:
         timeout=args.timeout,
         retries=args.retries,
         retry_sleep=args.retry_sleep,
+        google_thinking_budget=None if args.google_thinking_budget < 0 else args.google_thinking_budget,
     )
 
     existing_predictions = load_existing_predictions(args.out, model_names) if args.resume else {}
     preds: List[str] = []
     logger.info(
-        "Routing {} test rows with model={} endpoint={}",
+        "Routing {} test rows with provider={} model={} endpoint={}",
         len(test_df),
+        args.provider,
         args.model,
-        endpoint_from_base_url(args.base_url),
+        provider_endpoint(args.provider, args.base_url, args.model),
     )
 
     for row in tqdm(test_df.itertuples(index=False), total=len(test_df), desc="API routing"):
