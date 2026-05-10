@@ -669,7 +669,7 @@ def main() -> None:
     parser.add_argument(
         "--google-thinking-budget",
         type=int,
-        default=0,
+        default=-1,
         help="Google thinking budget. Use -1 to omit thinkingConfig.",
     )
     parser.add_argument("--timeout", type=float, default=60.0)
