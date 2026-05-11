@@ -27,7 +27,7 @@ from transformers import (
 @dataclass
 class RewardConfig:
     alpha: float = 0.85
-    cost_norm: str = "mean-row-max"
+    cost_norm: str = "global-max"
 
 
 @dataclass(frozen=True)
@@ -279,7 +279,7 @@ def normalize_cost(cost: pd.DataFrame, cfg: RewardConfig) -> pd.DataFrame:
 
 
 def compute_reward(perf: pd.DataFrame, cost: pd.DataFrame, cfg: RewardConfig) -> pd.DataFrame:
-    # For Reward_alpha = alpha * mean(P) - (1 - alpha) * mean(C) / mean(C_max),
+    # For Reward_alpha = alpha * mean(P) - (1 - alpha) * mean(C) / global(C_max),
     # per-row routing is equivalent to maximizing alpha * P_i,m - beta * C_i,m / D.
     return cfg.alpha * perf - (1.0 - cfg.alpha) * normalize_cost(cost, cfg)
 
@@ -410,7 +410,7 @@ def load_tokenizer(model_name: str, hf_token: Optional[str]) -> AutoTokenizer:
     tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
-    tokenizer.padding_side = "right"
+    tokenizer.padding_side = "left"  # for decoder-only models
     return tokenizer
 
 
@@ -724,9 +724,9 @@ def main() -> None:
     parser.add_argument("--alpha", type=float, default=0.85)
     parser.add_argument(
         "--cost-norm",
-        default="mean-row-max",
+        default="global-max",
         choices=["mean-row-max", "row-max", "global-max", "none"],
-        help="mean-row-max matches Reward = alpha * P_bar - beta * C_bar / Cmax_bar.",
+        help="global-max matches Reward = alpha * P_bar - beta * C_bar / Cmax.",
     )
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--epochs", type=float, default=1.0)
