@@ -2,6 +2,7 @@ import argparse
 import gc
 import inspect
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -27,6 +28,187 @@ from transformers import (
 class RewardConfig:
     alpha: float = 0.85
     cost_norm: str = "mean-row-max"
+
+
+@dataclass(frozen=True)
+class TaskProfile:
+    domain: str
+    subtask: str
+    difficulty: str
+
+    @property
+    def profile_key(self) -> str:
+        return f"{self.domain}/{self.subtask}/{self.difficulty}"
+
+    @property
+    def subtask_key(self) -> str:
+        return f"{self.domain}/{self.subtask}"
+
+
+TaskPriorTable = Dict[str, Dict[str, Tuple[int, np.ndarray]]]
+
+
+REPO_CODING_RE = re.compile(
+    r"<issue>|<code>|partial code base|traceback|\bdiff --git\b|\bpytest\b|"
+    r"\bgithub\b|\bbug\b|\bregression\b|\bexception\b|\berror\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+COMPETITIVE_CODING_RE = re.compile(
+    r"Sample Input|Sample Output|\bInput\s*\n|\bOutput\s*\n|Constraints\s*\n|"
+    r"Standard Input|AtCoder|Codeforces",
+    re.IGNORECASE | re.MULTILINE,
+)
+CODE_SNIPPET_RE = re.compile(
+    r"```|\bdef\s+\w+\s*\(|\bclass\s+\w+|\bimport\s+\w+|"
+    r"\bpublic\s+class\b|\bfunction\s+\w+",
+    re.IGNORECASE | re.MULTILINE,
+)
+MULTILINGUAL_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]")
+MATH_RE = re.compile(
+    r"\\frac|\\sqrt|\$|\bFind\b|\bLet\b|\bprobability\b|\binteger\b|"
+    r"\btriangle\b|\bparabola\b|\bprime\b|\bdivisor\b|\\log_",
+    re.IGNORECASE,
+)
+FACTUAL_QA_RE = re.compile(
+    r"^(Who|What|When|Where|Which|How many|In what|The .* called)\b",
+    re.IGNORECASE,
+)
+
+
+def contains_any(text: str, terms: List[str]) -> bool:
+    return any(term in text for term in terms)
+
+
+def infer_task_profile(query: str) -> TaskProfile:
+    """Approximate TRouter's domain/subtask/difficulty task profile locally."""
+    text = str(query)
+    lowered = text.lower()
+
+    if re.search(r"^\s*ARC-AGI Task\b", text, re.IGNORECASE):
+        domain, subtask = "arc_agi", "grid_abstraction"
+    elif REPO_CODING_RE.search(text):
+        domain, subtask = "coding", "repository_issue"
+    elif COMPETITIVE_CODING_RE.search(text):
+        domain, subtask = "coding", "competitive_programming"
+    elif CODE_SNIPPET_RE.search(text):
+        domain, subtask = "coding", "code_generation"
+    elif MULTILINGUAL_RE.search(text):
+        if contains_any(lowered, ["haiku", "poem", "rewrite", "translate", "summarize"]):
+            domain, subtask = "creative_language", "multilingual_writing"
+        else:
+            domain, subtask = "multilingual", "non_english"
+    elif MATH_RE.search(text):
+        domain, subtask = "math", "symbolic_reasoning"
+    elif contains_any(
+        lowered,
+        [
+            "physics",
+            "force",
+            "velocity",
+            "pressure",
+            "molecule",
+            "protein",
+            "e. coli",
+            "gene",
+            "cell",
+            "disease",
+            "chemical",
+            "co_2",
+            "resistance",
+        ],
+    ):
+        domain, subtask = "science", "science_qa"
+    elif FACTUAL_QA_RE.search(text.strip()):
+        domain, subtask = "factual_qa", "short_answer"
+    elif contains_any(lowered, ["summarize", "summary", "article", "rewrite", "write a", "story", "poem", "haiku", "creative"]):
+        domain, subtask = "creative_language", "writing_summarization"
+    elif contains_any(lowered, ["order", "cancel", "return", "refund", "tracking", "profile", "agent correctly handles"]):
+        domain, subtask = "agentic", "instruction_following"
+    elif contains_any(lowered, ["riddle", "correct order", "hint:", "logic puzzle"]):
+        domain, subtask = "reasoning", "puzzle"
+    else:
+        domain, subtask = "general", "general"
+
+    length = len(text)
+    if length >= 2500:
+        difficulty = "hard"
+    elif length >= 700:
+        difficulty = "medium"
+    else:
+        difficulty = "easy"
+
+    return TaskProfile(domain=domain, subtask=subtask, difficulty=difficulty)
+
+
+def infer_task_profiles(df: pd.DataFrame) -> pd.DataFrame:
+    profiles = [infer_task_profile(query) for query in df["query"].astype(str).tolist()]
+    return pd.DataFrame(
+        {
+            "task_domain": [profile.domain for profile in profiles],
+            "task_subtask": [profile.subtask for profile in profiles],
+            "task_difficulty": [profile.difficulty for profile in profiles],
+            "task_profile": [profile.profile_key for profile in profiles],
+            "task_subtask_key": [profile.subtask_key for profile in profiles],
+        }
+    )
+
+
+def log_task_summary(name: str, profiles: pd.DataFrame) -> None:
+    if profiles.empty:
+        return
+    counts = profiles["task_subtask_key"].value_counts().head(12)
+    formatted = ", ".join(f"{key}={count}" for key, count in counts.items())
+    logger.info("{} task profiles: {}", name, formatted)
+
+
+def build_task_reward_priors(
+    profiles: pd.DataFrame,
+    reward: pd.DataFrame,
+    smoothing: float,
+) -> TaskPriorTable:
+    global_prior = reward.mean(axis=0).to_numpy(dtype=np.float32)
+    stats: TaskPriorTable = {
+        "profile": {},
+        "subtask": {},
+        "domain": {},
+        "global": {"__global__": (len(reward), global_prior)},
+    }
+    group_specs = {
+        "profile": profiles["task_profile"],
+        "subtask": profiles["task_subtask_key"],
+        "domain": profiles["task_domain"],
+    }
+    for level, keys in group_specs.items():
+        for key, idx in keys.groupby(keys).groups.items():
+            positions = list(idx)
+            count = len(positions)
+            mean_scores = reward.iloc[positions].mean(axis=0).to_numpy(dtype=np.float32)
+            prior_scores = (count * mean_scores + smoothing * global_prior) / (count + smoothing)
+            stats[level][str(key)] = (count, prior_scores.astype(np.float32))
+    return stats
+
+
+def task_prior_scores(
+    profiles: pd.DataFrame,
+    priors: TaskPriorTable,
+    min_count: int,
+) -> np.ndarray:
+    global_scores = priors["global"]["__global__"][1]
+    rows = []
+    for _, row in profiles.iterrows():
+        candidates = (
+            ("profile", row["task_profile"]),
+            ("subtask", row["task_subtask_key"]),
+            ("domain", row["task_domain"]),
+        )
+        selected = global_scores
+        for level, key in candidates:
+            count_and_scores = priors.get(level, {}).get(str(key))
+            if count_and_scores is not None and count_and_scores[0] >= min_count:
+                selected = count_and_scores[1]
+                break
+        rows.append(selected)
+    return np.vstack(rows).astype(np.float32) if rows else np.empty((0, len(global_scores)), dtype=np.float32)
 
 
 def patch_bnb_params4bit() -> None:
@@ -473,6 +655,11 @@ def choose_models(
     model_names: List[str],
     alpha: float,
     clip_predictions: bool,
+    task_profiles: Optional[pd.DataFrame] = None,
+    task_reward_priors: Optional[TaskPriorTable] = None,
+    task_prior_weight: float = 0.0,
+    coding_task_prior_weight: Optional[float] = None,
+    task_prior_min_count: int = 20,
 ) -> List[str]:
     perf_scores = perf_pred
     cost_scores = cost_pred_norm
@@ -481,6 +668,19 @@ def choose_models(
         cost_scores = np.clip(cost_scores, 0.0, None)
 
     reward_scores = alpha * perf_scores - (1.0 - alpha) * cost_scores
+    if task_profiles is not None and task_reward_priors is not None and task_prior_weight > 0:
+        prior_scores = task_prior_scores(
+            task_profiles,
+            task_reward_priors,
+            min_count=task_prior_min_count,
+        )
+        if prior_scores.shape == reward_scores.shape:
+            row_weights = np.full(len(task_profiles), task_prior_weight, dtype=np.float32)
+            if coding_task_prior_weight is not None:
+                coding_mask = task_profiles["task_domain"].eq("coding").to_numpy()
+                row_weights[coding_mask] = coding_task_prior_weight
+            row_weights = np.clip(row_weights, 0.0, 1.0)[:, None]
+            reward_scores = (1.0 - row_weights) * reward_scores + row_weights * prior_scores
     pred_ids = np.argmax(reward_scores, axis=1)
     return [model_names[idx] for idx in pred_ids]
 
@@ -493,9 +693,13 @@ def save_score_debug(
     perf_pred: np.ndarray,
     cost_pred_norm: np.ndarray,
     preds: List[str],
+    task_profiles: Optional[pd.DataFrame] = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = pd.DataFrame({"ID": ids, "pred_model": preds})
+    if task_profiles is not None:
+        for col in ["task_domain", "task_subtask", "task_difficulty", "task_profile"]:
+            rows[col] = task_profiles[col].to_list()
     for idx, model_name in enumerate(model_names):
         rows[f"{model_name}_pred_perf"] = perf_pred[:, idx]
         rows[f"{model_name}_pred_cost_norm"] = cost_pred_norm[:, idx]
@@ -511,8 +715,12 @@ def main() -> None:
     parser.add_argument("--mode", choices=["train-predict", "predict-only"], default="train-predict")
     parser.add_argument("--perf-model", default="withmartian/starcoder2-3b-bcbToppers-perf")
     parser.add_argument("--cost-model", default="withmartian/starcoder2-3b-bcbToppers-cost")
+    parser.add_argument("--coding-perf-model", default="withmartian/starcoder2-3b-bcbToppers-perf")
+    parser.add_argument("--coding-cost-model", default="withmartian/starcoder2-3b-bcbToppers-cost")
     parser.add_argument("--perf-adapter", default="")
     parser.add_argument("--cost-adapter", default="")
+    parser.add_argument("--coding-perf-adapter", default="")
+    parser.add_argument("--coding-cost-adapter", default="")
     parser.add_argument("--alpha", type=float, default=0.85)
     parser.add_argument(
         "--cost-norm",
@@ -554,6 +762,15 @@ def main() -> None:
     parser.add_argument("--max-cpu-mem", default="48GiB")
     parser.add_argument("--attn-implementation", default="")
     parser.add_argument("--no-clip-preds", dest="clip_preds", action="store_false")
+    parser.add_argument("--task-aware", action="store_true", default=True)
+    parser.add_argument("--no-task-aware", dest="task_aware", action="store_false")
+    parser.add_argument("--task-prior-weight", type=float, default=0.15)
+    parser.add_argument("--coding-task-prior-weight", type=float, default=0.30)
+    parser.add_argument("--task-prior-min-count", type=int, default=20)
+    parser.add_argument("--task-prior-smoothing", type=float, default=50.0)
+    parser.add_argument("--coding-specialist", action="store_true", default=True)
+    parser.add_argument("--no-coding-specialist", dest="coding_specialist", action="store_false")
+    parser.add_argument("--min-coding-train-rows", type=int, default=128)
     parser.add_argument("--save-score-debug", action="store_true")
     args = parser.parse_args()
 
@@ -588,6 +805,12 @@ def main() -> None:
     train_idx, val_idx = split_train_val_indices(len(train_df), args.val_ratio, args.seed)
     train_part = train_df.iloc[train_idx].reset_index(drop=True)
     val_part = train_df.iloc[val_idx].reset_index(drop=True) if len(val_idx) else None
+    full_profiles = infer_task_profiles(train_df)
+    train_profiles = infer_task_profiles(train_part)
+    val_profiles = infer_task_profiles(val_part) if val_part is not None else None
+    test_profiles = infer_task_profiles(test_df)
+    log_task_summary("Train", full_profiles)
+    log_task_summary("Test", test_profiles)
 
     perf_train = perf.iloc[train_idx].reset_index(drop=True)
     cost_train = cost_norm.iloc[train_idx].reset_index(drop=True)
@@ -596,6 +819,34 @@ def main() -> None:
 
     perf_adapter = args.perf_adapter or str(out_dir / "perf_adapter")
     cost_adapter = args.cost_adapter or str(out_dir / "cost_adapter")
+    coding_perf_adapter = args.coding_perf_adapter or str(out_dir / "coding_perf_adapter")
+    coding_cost_adapter = args.coding_cost_adapter or str(out_dir / "coding_cost_adapter")
+    coding_specialist_available = args.coding_specialist
+    if args.mode == "predict-only" and args.coding_specialist:
+        missing_coding_adapters = [
+            path for path in [coding_perf_adapter, coding_cost_adapter] if not Path(path).exists()
+        ]
+        if missing_coding_adapters:
+            coding_specialist_available = False
+            logger.warning(
+                "Skipping coding specialist in predict-only mode because adapters are missing: {}",
+                ", ".join(missing_coding_adapters),
+            )
+
+    train_task_priors = None
+    test_task_priors = None
+    if args.task_aware:
+        train_reward_for_priors = args.alpha * perf_train - (1.0 - args.alpha) * cost_train
+        train_task_priors = build_task_reward_priors(
+            train_profiles,
+            train_reward_for_priors,
+            smoothing=args.task_prior_smoothing,
+        )
+        test_task_priors = build_task_reward_priors(
+            full_profiles,
+            oracle_reward,
+            smoothing=args.task_prior_smoothing,
+        )
 
     perf_val_pred, perf_test_pred = train_or_predict_one_target(
         target_name="perf",
@@ -627,6 +878,90 @@ def main() -> None:
         hf_token=hf_token,
     )
 
+    coding_train_mask = train_profiles["task_domain"].eq("coding").to_numpy()
+    test_coding_mask = test_profiles["task_domain"].eq("coding").to_numpy()
+    val_coding_mask = val_profiles["task_domain"].eq("coding").to_numpy() if val_profiles is not None else None
+    coding_train_count = int(coding_train_mask.sum())
+    should_run_coding_specialist = (
+        coding_specialist_available
+        and coding_train_count >= args.min_coding_train_rows
+        and bool(test_coding_mask.any())
+    )
+    if should_run_coding_specialist:
+        logger.info(
+            "Training/predicting coding specialist with {} rows using {} and {}",
+            coding_train_count,
+            args.coding_perf_model,
+            args.coding_cost_model,
+        )
+        coding_train_part = train_part.loc[coding_train_mask].reset_index(drop=True)
+        coding_perf_train = perf_train.loc[coding_train_mask].reset_index(drop=True)
+        coding_cost_train = cost_train.loc[coding_train_mask].reset_index(drop=True)
+
+        coding_val_part = None
+        coding_perf_val = None
+        coding_cost_val = None
+        if val_part is not None and val_coding_mask is not None and val_coding_mask.any():
+            coding_val_part = val_part.loc[val_coding_mask].reset_index(drop=True)
+            coding_perf_val = perf_val.loc[val_coding_mask].reset_index(drop=True) if perf_val is not None else None
+            coding_cost_val = cost_val.loc[val_coding_mask].reset_index(drop=True) if cost_val is not None else None
+
+        coding_test_part = test_df.loc[test_coding_mask].reset_index(drop=True)
+
+        coding_perf_val_pred, coding_perf_test_pred = train_or_predict_one_target(
+            target_name="coding_perf",
+            model_name=args.coding_perf_model,
+            adapter_path=coding_perf_adapter,
+            output_dir=out_dir,
+            train_df=coding_train_part,
+            val_df=coding_val_part,
+            test_df=coding_test_part,
+            train_target=coding_perf_train,
+            val_target=coding_perf_val,
+            models=model_names,
+            args=args,
+            hf_token=hf_token,
+        )
+
+        coding_cost_val_pred, coding_cost_test_pred = train_or_predict_one_target(
+            target_name="coding_cost",
+            model_name=args.coding_cost_model,
+            adapter_path=coding_cost_adapter,
+            output_dir=out_dir,
+            train_df=coding_train_part,
+            val_df=coding_val_part,
+            test_df=coding_test_part,
+            train_target=coding_cost_train,
+            val_target=coding_cost_val,
+            models=model_names,
+            args=args,
+            hf_token=hf_token,
+        )
+
+        perf_test_pred = perf_test_pred.copy()
+        cost_test_pred = cost_test_pred.copy()
+        perf_test_pred[test_coding_mask] = coding_perf_test_pred
+        cost_test_pred[test_coding_mask] = coding_cost_test_pred
+
+        if (
+            perf_val_pred is not None
+            and cost_val_pred is not None
+            and val_coding_mask is not None
+            and val_coding_mask.any()
+            and coding_perf_val_pred is not None
+            and coding_cost_val_pred is not None
+        ):
+            perf_val_pred = perf_val_pred.copy()
+            cost_val_pred = cost_val_pred.copy()
+            perf_val_pred[val_coding_mask] = coding_perf_val_pred
+            cost_val_pred[val_coding_mask] = coding_cost_val_pred
+    elif args.coding_specialist:
+        logger.info(
+            "Skipping coding specialist: coding_train_rows={}, test_coding_rows={}",
+            coding_train_count,
+            int(test_coding_mask.sum()),
+        )
+
     if perf_val_pred is not None and cost_val_pred is not None and len(val_idx):
         val_preds = choose_models(
             perf_val_pred,
@@ -634,6 +969,11 @@ def main() -> None:
             model_names,
             alpha=args.alpha,
             clip_predictions=args.clip_preds,
+            task_profiles=val_profiles if args.task_aware else None,
+            task_reward_priors=train_task_priors,
+            task_prior_weight=args.task_prior_weight if args.task_aware else 0.0,
+            coding_task_prior_weight=args.coding_task_prior_weight,
+            task_prior_min_count=args.task_prior_min_count,
         )
         val_perf = perf.iloc[val_idx].reset_index(drop=True)
         val_cost = cost.iloc[val_idx].reset_index(drop=True)
@@ -655,6 +995,7 @@ def main() -> None:
                 perf_val_pred,
                 cost_val_pred,
                 val_preds,
+                task_profiles=val_profiles,
             )
 
     test_preds = choose_models(
@@ -663,6 +1004,11 @@ def main() -> None:
         model_names,
         alpha=args.alpha,
         clip_predictions=args.clip_preds,
+        task_profiles=test_profiles if args.task_aware else None,
+        task_reward_priors=test_task_priors,
+        task_prior_weight=args.task_prior_weight if args.task_aware else 0.0,
+        coding_task_prior_weight=args.coding_task_prior_weight,
+        task_prior_min_count=args.task_prior_min_count,
     )
     make_submission(test_df, test_preds, args.out)
     logger.info("Saved submission to {}", args.out)
@@ -676,6 +1022,7 @@ def main() -> None:
             perf_test_pred,
             cost_test_pred,
             test_preds,
+            task_profiles=test_profiles,
         )
 
 
