@@ -649,10 +649,9 @@ def train_or_predict_one_target(
     return val_predictions, test_predictions
 
 
-def choose_models(
+def compute_router_scores(
     perf_pred: np.ndarray,
     cost_pred_norm: np.ndarray,
-    model_names: List[str],
     alpha: float,
     clip_predictions: bool,
     task_profiles: Optional[pd.DataFrame] = None,
@@ -681,8 +680,53 @@ def choose_models(
                 row_weights[coding_mask] = coding_task_prior_weight
             row_weights = np.clip(row_weights, 0.0, 1.0)[:, None]
             reward_scores = (1.0 - row_weights) * reward_scores + row_weights * prior_scores
+    return reward_scores.astype(np.float32)
+
+
+def models_from_scores(reward_scores: np.ndarray, model_names: List[str]) -> List[str]:
     pred_ids = np.argmax(reward_scores, axis=1)
     return [model_names[idx] for idx in pred_ids]
+
+
+def choose_models(
+    perf_pred: np.ndarray,
+    cost_pred_norm: np.ndarray,
+    model_names: List[str],
+    alpha: float,
+    clip_predictions: bool,
+    task_profiles: Optional[pd.DataFrame] = None,
+    task_reward_priors: Optional[TaskPriorTable] = None,
+    task_prior_weight: float = 0.0,
+    coding_task_prior_weight: Optional[float] = None,
+    task_prior_min_count: int = 20,
+) -> List[str]:
+    reward_scores = compute_router_scores(
+        perf_pred=perf_pred,
+        cost_pred_norm=cost_pred_norm,
+        alpha=alpha,
+        clip_predictions=clip_predictions,
+        task_profiles=task_profiles,
+        task_reward_priors=task_reward_priors,
+        task_prior_weight=task_prior_weight,
+        coding_task_prior_weight=coding_task_prior_weight,
+        task_prior_min_count=task_prior_min_count,
+    )
+    return models_from_scores(reward_scores, model_names)
+
+
+def save_reward_scores(out_path: str, ids: pd.Series, model_names: List[str], scores: np.ndarray) -> None:
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scores = scores.astype(np.float32)
+    if path.suffix.lower() == ".npz":
+        np.savez_compressed(
+            path,
+            scores=scores,
+            ids=ids.to_numpy(),
+            model_names=np.array(model_names),
+        )
+    else:
+        np.save(path, scores)
 
 
 def save_score_debug(
@@ -772,6 +816,16 @@ def main() -> None:
     parser.add_argument("--no-coding-specialist", dest="coding_specialist", action="store_false")
     parser.add_argument("--min-coding-train-rows", type=int, default=128)
     parser.add_argument("--save-score-debug", action="store_true")
+    parser.add_argument(
+        "--save-reward-scores",
+        default="",
+        help="Optional .npz/.npy path for final test reward scores, for downstream ensembling.",
+    )
+    parser.add_argument(
+        "--save-val-reward-scores",
+        default="",
+        help="Optional .npz/.npy path for validation reward scores.",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -963,10 +1017,9 @@ def main() -> None:
         )
 
     if perf_val_pred is not None and cost_val_pred is not None and len(val_idx):
-        val_preds = choose_models(
-            perf_val_pred,
-            cost_val_pred,
-            model_names,
+        val_reward_scores = compute_router_scores(
+            perf_pred=perf_val_pred,
+            cost_pred_norm=cost_val_pred,
             alpha=args.alpha,
             clip_predictions=args.clip_preds,
             task_profiles=val_profiles if args.task_aware else None,
@@ -975,6 +1028,7 @@ def main() -> None:
             coding_task_prior_weight=args.coding_task_prior_weight,
             task_prior_min_count=args.task_prior_min_count,
         )
+        val_preds = models_from_scores(val_reward_scores, model_names)
         val_perf = perf.iloc[val_idx].reset_index(drop=True)
         val_cost = cost.iloc[val_idx].reset_index(drop=True)
         val_reward = evaluate_policy_reward(val_perf, val_cost, val_preds, cfg)
@@ -997,11 +1051,17 @@ def main() -> None:
                 val_preds,
                 task_profiles=val_profiles,
             )
+        if args.save_val_reward_scores:
+            save_reward_scores(
+                args.save_val_reward_scores,
+                train_df.iloc[val_idx]["ID"].reset_index(drop=True),
+                model_names,
+                val_reward_scores,
+            )
 
-    test_preds = choose_models(
-        perf_test_pred,
-        cost_test_pred,
-        model_names,
+    test_reward_scores = compute_router_scores(
+        perf_pred=perf_test_pred,
+        cost_pred_norm=cost_test_pred,
         alpha=args.alpha,
         clip_predictions=args.clip_preds,
         task_profiles=test_profiles if args.task_aware else None,
@@ -1010,8 +1070,13 @@ def main() -> None:
         coding_task_prior_weight=args.coding_task_prior_weight,
         task_prior_min_count=args.task_prior_min_count,
     )
+    test_preds = models_from_scores(test_reward_scores, model_names)
     make_submission(test_df, test_preds, args.out)
     logger.info("Saved submission to {}", args.out)
+
+    if args.save_reward_scores:
+        save_reward_scores(args.save_reward_scores, test_df["ID"], model_names, test_reward_scores)
+        logger.info("Saved test reward scores to {}", args.save_reward_scores)
 
     if args.save_score_debug:
         save_score_debug(
