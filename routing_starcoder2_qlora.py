@@ -2,6 +2,7 @@ import argparse
 import gc
 import inspect
 import os
+import pickle
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,10 @@ import torch
 from datasets import Dataset
 from loguru import logger
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model, prepare_model_for_kbit_training
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import normalize
+from torch import nn
 from tqdm import tqdm
 from transformers import (
     AutoModelForSequenceClassification,
@@ -209,6 +214,323 @@ def task_prior_scores(
                 break
         rows.append(selected)
     return np.vstack(rows).astype(np.float32) if rows else np.empty((0, len(global_scores)), dtype=np.float32)
+
+
+def irt_artifact_paths(args, out_dir: Path) -> Tuple[Path, Path]:
+    router_path = Path(args.irt_router_path) if args.irt_router_path else out_dir / "irt_router.pt"
+    feature_path = router_path.with_name(f"{router_path.stem}_features.pkl")
+    return router_path, feature_path
+
+
+def fit_query_embedder(texts: List[str], args):
+    vectorizer = TfidfVectorizer(
+        analyzer=args.irt_tfidf_analyzer,
+        ngram_range=(args.irt_tfidf_ngram_min, args.irt_tfidf_ngram_max),
+        max_features=args.irt_tfidf_max_features,
+        min_df=args.irt_tfidf_min_df,
+        max_df=args.irt_tfidf_max_df,
+        sublinear_tf=True,
+        strip_accents="unicode",
+    )
+    try:
+        features = vectorizer.fit_transform(texts)
+    except ValueError:
+        logger.warning("Retrying IRT TF-IDF fitting with min_df=1 after empty vocabulary")
+        vectorizer.set_params(min_df=1)
+        features = vectorizer.fit_transform(texts)
+
+    svd = None
+    if args.irt_query_dim > 0 and features.shape[1] > args.irt_query_dim:
+        n_components = min(args.irt_query_dim, features.shape[0] - 1, features.shape[1] - 1)
+        if n_components >= 1:
+            svd = TruncatedSVD(n_components=n_components, random_state=args.seed)
+            embeddings = svd.fit_transform(features)
+        else:
+            embeddings = features.toarray()
+    else:
+        embeddings = features.toarray()
+
+    embeddings = normalize(np.asarray(embeddings, dtype=np.float32))
+    return {"vectorizer": vectorizer, "svd": svd}, embeddings.astype(np.float32)
+
+
+def transform_query_embeddings(embedder, texts: List[str]) -> np.ndarray:
+    features = embedder["vectorizer"].transform(texts)
+    svd = embedder.get("svd")
+    embeddings = svd.transform(features) if svd is not None else features.toarray()
+    embeddings = normalize(np.asarray(embeddings, dtype=np.float32))
+    return embeddings.astype(np.float32)
+
+
+def warm_up_query_embeddings(
+    train_embeddings: np.ndarray,
+    target_embeddings: np.ndarray,
+    k: int,
+    warmup_lambda: float,
+) -> np.ndarray:
+    if (
+        len(train_embeddings) == 0
+        or len(target_embeddings) == 0
+        or k <= 0
+        or warmup_lambda <= 0.0
+    ):
+        return target_embeddings.astype(np.float32)
+
+    k = min(k, len(train_embeddings))
+    train_norm = normalize(train_embeddings.astype(np.float32))
+    target_norm = normalize(target_embeddings.astype(np.float32))
+    similarities = target_norm @ train_norm.T
+    neighbor_idx = np.argpartition(-similarities, kth=k - 1, axis=1)[:, :k]
+    warm_embeddings = train_embeddings[neighbor_idx].mean(axis=1)
+    mixed = (1.0 - warmup_lambda) * target_embeddings + warmup_lambda * warm_embeddings
+    return normalize(mixed.astype(np.float32)).astype(np.float32)
+
+
+class MIRTRouter(nn.Module):
+    def __init__(self, query_dim: int, n_models: int, latent_dim: int):
+        super().__init__()
+        self.query_dim = query_dim
+        self.n_models = n_models
+        self.latent_dim = latent_dim
+        self.discrimination = nn.Linear(query_dim, latent_dim)
+        self.difficulty = nn.Linear(query_dim, 1)
+        self.model_ability = nn.Embedding(n_models, latent_dim)
+        nn.init.normal_(self.model_ability.weight, mean=0.0, std=0.02)
+
+    def forward(self, query_embeddings: torch.Tensor, model_ids: torch.Tensor) -> torch.Tensor:
+        discrimination = torch.nn.functional.softplus(self.discrimination(query_embeddings)) + 1e-4
+        difficulty = self.difficulty(query_embeddings).squeeze(-1)
+        ability = self.model_ability(model_ids)
+        return torch.sum(discrimination * ability, dim=-1) - difficulty
+
+
+def train_mirt_router(
+    train_embeddings: np.ndarray,
+    target_perf: pd.DataFrame,
+    model_names: List[str],
+    args,
+) -> MIRTRouter:
+    if len(train_embeddings) == 0:
+        raise ValueError("MIRT-Router requires at least one general training query")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MIRTRouter(
+        query_dim=train_embeddings.shape[1],
+        n_models=len(model_names),
+        latent_dim=args.irt_latent_dim,
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.irt_lr, weight_decay=args.irt_weight_decay)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    x_cpu = torch.from_numpy(train_embeddings.astype(np.float32))
+    y_cpu = torch.from_numpy(np.clip(target_perf.to_numpy(dtype=np.float32), 0.0, 1.0))
+    model_ids = torch.arange(len(model_names), dtype=torch.long, device=device)
+    rng = np.random.default_rng(args.seed)
+    batch_size = max(1, min(args.irt_batch_size, len(train_embeddings)))
+    log_every = max(1, args.irt_epochs // 10)
+
+    for epoch in range(args.irt_epochs):
+        model.train()
+        order = rng.permutation(len(train_embeddings))
+        total_loss = 0.0
+        total_items = 0
+        for start in range(0, len(order), batch_size):
+            idx = order[start : start + batch_size]
+            batch_x = x_cpu[idx].to(device)
+            batch_y = y_cpu[idx].to(device)
+            repeated_x = batch_x.repeat_interleave(len(model_names), dim=0)
+            repeated_model_ids = model_ids.repeat(len(idx))
+            logits = model(repeated_x, repeated_model_ids)
+            loss = loss_fn(logits, batch_y.reshape(-1))
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.irt_max_grad_norm)
+            optimizer.step()
+
+            total_loss += float(loss.detach().cpu()) * len(idx)
+            total_items += len(idx)
+
+        if epoch == 0 or (epoch + 1) % log_every == 0 or epoch + 1 == args.irt_epochs:
+            logger.info(
+                "MIRT epoch {}/{} loss {:.6f}",
+                epoch + 1,
+                args.irt_epochs,
+                total_loss / max(1, total_items),
+            )
+
+    return model
+
+
+def predict_mirt_performance(
+    model: MIRTRouter,
+    embeddings: np.ndarray,
+    batch_size: int,
+) -> np.ndarray:
+    if len(embeddings) == 0:
+        return np.empty((0, model.n_models), dtype=np.float32)
+
+    device = next(model.parameters()).device
+    model.eval()
+    model_ids = torch.arange(model.n_models, dtype=torch.long, device=device)
+    preds = []
+    with torch.no_grad():
+        for start in range(0, len(embeddings), batch_size):
+            batch = torch.from_numpy(embeddings[start : start + batch_size].astype(np.float32)).to(device)
+            repeated_x = batch.repeat_interleave(model.n_models, dim=0)
+            repeated_model_ids = model_ids.repeat(len(batch))
+            logits = model(repeated_x, repeated_model_ids)
+            perf = torch.sigmoid(logits).reshape(len(batch), model.n_models)
+            preds.append(perf.cpu().numpy().astype(np.float32))
+    return np.vstack(preds).astype(np.float32)
+
+
+def fixed_model_cost_from_train(cost_norm: pd.DataFrame) -> np.ndarray:
+    return cost_norm.mean(axis=0).to_numpy(dtype=np.float32)
+
+
+def compute_irt_reward_scores(
+    perf_pred: np.ndarray,
+    fixed_cost_norm: np.ndarray,
+    alpha: float,
+    clip_predictions: bool,
+) -> np.ndarray:
+    perf_scores = perf_pred
+    cost_scores = fixed_cost_norm.astype(np.float32)
+    if clip_predictions:
+        perf_scores = np.clip(perf_scores, 0.0, 1.0)
+        cost_scores = np.clip(cost_scores, 0.0, None)
+    return (alpha * perf_scores - (1.0 - alpha) * cost_scores[None, :]).astype(np.float32)
+
+
+def save_irt_router(
+    router_path: Path,
+    feature_path: Path,
+    model: MIRTRouter,
+    embedder,
+    model_names: List[str],
+    fixed_cost_norm: np.ndarray,
+    train_embeddings: np.ndarray,
+) -> None:
+    router_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "query_dim": model.query_dim,
+            "latent_dim": model.latent_dim,
+            "n_models": model.n_models,
+            "model_names": model_names,
+            "fixed_cost_norm": fixed_cost_norm.astype(np.float32),
+            "train_embeddings": train_embeddings.astype(np.float32),
+        },
+        router_path,
+    )
+    with open(feature_path, "wb") as f:
+        pickle.dump(embedder, f)
+
+
+def load_torch_checkpoint(path: Path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def load_irt_router(router_path: Path, feature_path: Path, model_names: List[str]) -> Tuple[MIRTRouter, object, np.ndarray, np.ndarray]:
+    if not router_path.exists() or not feature_path.exists():
+        raise ValueError(
+            f"predict-only mode requires saved IRT artifacts: {router_path} and {feature_path}"
+        )
+    checkpoint = load_torch_checkpoint(router_path)
+    saved_models = list(checkpoint["model_names"])
+    if saved_models != model_names:
+        raise ValueError(f"IRT artifact model order mismatch: saved={saved_models}, current={model_names}")
+
+    model = MIRTRouter(
+        query_dim=int(checkpoint["query_dim"]),
+        n_models=int(checkpoint["n_models"]),
+        latent_dim=int(checkpoint["latent_dim"]),
+    )
+    model.load_state_dict(checkpoint["state_dict"])
+    with open(feature_path, "rb") as f:
+        embedder = pickle.load(f)
+    return (
+        model,
+        embedder,
+        np.asarray(checkpoint["fixed_cost_norm"], dtype=np.float32),
+        np.asarray(checkpoint["train_embeddings"], dtype=np.float32),
+    )
+
+
+def train_or_predict_irt_router(
+    train_df: pd.DataFrame,
+    val_df: Optional[pd.DataFrame],
+    test_df: pd.DataFrame,
+    train_perf: pd.DataFrame,
+    train_cost_norm: pd.DataFrame,
+    model_names: List[str],
+    args,
+    out_dir: Path,
+) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:
+    router_path, feature_path = irt_artifact_paths(args, out_dir)
+    if args.mode == "train-predict":
+        logger.info("Fitting MIRT query embeddings on {} general rows", len(train_df))
+        embedder, train_embeddings = fit_query_embedder(train_df["query"].astype(str).tolist(), args)
+        fixed_cost_norm = fixed_model_cost_from_train(train_cost_norm)
+        logger.info(
+            "Training MIRT-Router with latent_dim={} and fixed mean model costs",
+            args.irt_latent_dim,
+        )
+        model = train_mirt_router(train_embeddings, train_perf, model_names, args)
+        save_irt_router(
+            router_path,
+            feature_path,
+            model,
+            embedder,
+            model_names,
+            fixed_cost_norm,
+            train_embeddings,
+        )
+        logger.info("Saved MIRT artifacts to {} and {}", router_path, feature_path)
+    else:
+        logger.info("Loading MIRT-Router artifacts from {}", router_path)
+        model, embedder, fixed_cost_norm, train_embeddings = load_irt_router(
+            router_path,
+            feature_path,
+            model_names,
+        )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    val_perf_pred = None
+    if val_df is not None and len(val_df) > 0:
+        val_embeddings = transform_query_embeddings(embedder, val_df["query"].astype(str).tolist())
+        val_embeddings = warm_up_query_embeddings(
+            train_embeddings,
+            val_embeddings,
+            k=args.irt_warmup_k,
+            warmup_lambda=args.irt_warmup_lambda,
+        )
+        val_perf_pred = predict_mirt_performance(model, val_embeddings, args.irt_predict_batch_size)
+
+    test_perf_pred = np.empty((0, len(model_names)), dtype=np.float32)
+    if len(test_df) > 0:
+        test_embeddings = transform_query_embeddings(embedder, test_df["query"].astype(str).tolist())
+        test_embeddings = warm_up_query_embeddings(
+            train_embeddings,
+            test_embeddings,
+            k=args.irt_warmup_k,
+            warmup_lambda=args.irt_warmup_lambda,
+        )
+        test_perf_pred = predict_mirt_performance(model, test_embeddings, args.irt_predict_batch_size)
+
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return val_perf_pred, test_perf_pred, fixed_cost_norm
 
 
 def patch_bnb_params4bit() -> None:
@@ -556,13 +878,14 @@ def train_or_predict_one_target(
     models: List[str],
     args,
     hf_token: Optional[str],
+    direct_model: bool = False,
 ) -> Tuple[Optional[np.ndarray], np.ndarray]:
     logger.info("Loading tokenizer for {}: {}", target_name, model_name)
     tokenizer = load_tokenizer(model_name, hf_token)
 
     train_ds = None
     val_ds = None
-    if args.mode == "train-predict":
+    if args.mode == "train-predict" and not direct_model:
         if train_target is None:
             raise ValueError("train_target is required in train-predict mode")
         train_ds = build_regression_dataset(
@@ -582,14 +905,24 @@ def train_or_predict_one_target(
                 tokenize_batch_size=args.tokenize_batch_size,
                 desc=f"Tokenizing {target_name} val",
             )
+    elif val_df is not None and len(val_df) > 0:
+        val_ds = build_inference_dataset(
+            val_df,
+            tokenizer,
+            max_length=args.max_length,
+            tokenize_batch_size=args.tokenize_batch_size,
+            desc=f"Tokenizing {target_name} val",
+        )
 
-    test_ds = build_inference_dataset(
-        test_df,
-        tokenizer,
-        max_length=args.max_length,
-        tokenize_batch_size=args.tokenize_batch_size,
-        desc=f"Tokenizing {target_name} test",
-    )
+    test_ds = None
+    if len(test_df) > 0:
+        test_ds = build_inference_dataset(
+            test_df,
+            tokenizer,
+            max_length=args.max_length,
+            tokenize_batch_size=args.tokenize_batch_size,
+            desc=f"Tokenizing {target_name} test",
+        )
 
     logger.info("Loading {} model", target_name)
     model = load_sequence_regressor(
@@ -597,10 +930,12 @@ def train_or_predict_one_target(
         models=models,
         args=args,
         hf_token=hf_token,
-        for_training=args.mode == "train-predict",
+        for_training=args.mode == "train-predict" and not direct_model,
     )
 
-    if args.mode == "train-predict":
+    if direct_model:
+        logger.info("Using {} base fine-tuned checkpoint directly", target_name)
+    elif args.mode == "train-predict":
         model = attach_lora(model, args)
     else:
         if not adapter_path:
@@ -621,10 +956,10 @@ def train_or_predict_one_target(
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=data_collator,
-        compute_metrics=compute_regression_metrics if val_ds is not None else None,
+        compute_metrics=compute_regression_metrics if val_ds is not None and not direct_model else None,
     )
 
-    if args.mode == "train-predict":
+    if args.mode == "train-predict" and not direct_model:
         logger.info("Training {} adapter", target_name)
         trainer.train()
         save_path = adapter_path or str(output_dir / f"{target_name}_adapter")
@@ -637,8 +972,10 @@ def train_or_predict_one_target(
         logger.info("Predicting {} validation scores", target_name)
         val_predictions = trainer.predict(val_ds).predictions.astype(np.float32)
 
-    logger.info("Predicting {} test scores", target_name)
-    test_predictions = trainer.predict(test_ds).predictions.astype(np.float32)
+    test_predictions = np.empty((0, len(models)), dtype=np.float32)
+    if test_ds is not None:
+        logger.info("Predicting {} test scores", target_name)
+        test_predictions = trainer.predict(test_ds).predictions.astype(np.float32)
 
     del trainer
     del model
@@ -659,7 +996,7 @@ def compute_router_scores(
     task_prior_weight: float = 0.0,
     coding_task_prior_weight: Optional[float] = None,
     task_prior_min_count: int = 20,
-) -> List[str]:
+) -> np.ndarray:
     perf_scores = perf_pred
     cost_scores = cost_pred_norm
     if clip_predictions:
@@ -738,9 +1075,12 @@ def save_score_debug(
     cost_pred_norm: np.ndarray,
     preds: List[str],
     task_profiles: Optional[pd.DataFrame] = None,
+    router_sources: Optional[np.ndarray] = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = pd.DataFrame({"ID": ids, "pred_model": preds})
+    if router_sources is not None:
+        rows["router_source"] = list(router_sources)
     if task_profiles is not None:
         for col in ["task_domain", "task_subtask", "task_difficulty", "task_profile"]:
             rows[col] = task_profiles[col].to_list()
@@ -814,7 +1154,36 @@ def main() -> None:
     parser.add_argument("--task-prior-smoothing", type=float, default=50.0)
     parser.add_argument("--coding-specialist", action="store_true", default=True)
     parser.add_argument("--no-coding-specialist", dest="coding_specialist", action="store_false")
-    parser.add_argument("--min-coding-train-rows", type=int, default=128)
+    parser.add_argument(
+        "--coding-direct-model",
+        action="store_true",
+        default=True,
+        help="Use the fine-tuned StarCoder perf/cost checkpoints directly for coding rows.",
+    )
+    parser.add_argument(
+        "--no-coding-direct-model",
+        dest="coding_direct_model",
+        action="store_false",
+        help="Train/load coding-only QLoRA adapters instead of direct fine-tuned checkpoints.",
+    )
+    parser.add_argument("--min-coding-train-rows", type=int, default=1)
+    parser.add_argument("--irt-router-path", default="")
+    parser.add_argument("--irt-latent-dim", type=int, default=25)
+    parser.add_argument("--irt-query-dim", type=int, default=256)
+    parser.add_argument("--irt-epochs", type=int, default=80)
+    parser.add_argument("--irt-batch-size", type=int, default=512)
+    parser.add_argument("--irt-predict-batch-size", type=int, default=256)
+    parser.add_argument("--irt-lr", type=float, default=2e-3)
+    parser.add_argument("--irt-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--irt-max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--irt-warmup-k", type=int, default=5)
+    parser.add_argument("--irt-warmup-lambda", type=float, default=0.2)
+    parser.add_argument("--irt-tfidf-analyzer", default="char_wb", choices=["word", "char", "char_wb"])
+    parser.add_argument("--irt-tfidf-ngram-min", type=int, default=3)
+    parser.add_argument("--irt-tfidf-ngram-max", type=int, default=5)
+    parser.add_argument("--irt-tfidf-max-features", type=int, default=50000)
+    parser.add_argument("--irt-tfidf-min-df", type=int, default=1)
+    parser.add_argument("--irt-tfidf-max-df", type=float, default=0.98)
     parser.add_argument("--save-score-debug", action="store_true")
     parser.add_argument(
         "--save-reward-scores",
@@ -832,9 +1201,14 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    if args.mode == "predict-only" and (not args.perf_adapter or not args.cost_adapter):
-        raise ValueError("predict-only mode requires both --perf-adapter and --cost-adapter")
-
+    if args.irt_tfidf_ngram_min > args.irt_tfidf_ngram_max:
+        raise ValueError("--irt-tfidf-ngram-min must be <= --irt-tfidf-ngram-max")
+    if not 0.0 <= args.irt_warmup_lambda <= 1.0:
+        raise ValueError("--irt-warmup-lambda must be in [0, 1]")
+    if args.task_aware:
+        logger.info(
+            "Legacy task-aware priors are bypassed: general rows use MIRT-Router, coding rows use StarCoder"
+        )
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -871,12 +1245,116 @@ def main() -> None:
     perf_val = perf.iloc[val_idx].reset_index(drop=True) if len(val_idx) else None
     cost_val = cost_norm.iloc[val_idx].reset_index(drop=True) if len(val_idx) else None
 
-    perf_adapter = args.perf_adapter or str(out_dir / "perf_adapter")
-    cost_adapter = args.cost_adapter or str(out_dir / "cost_adapter")
     coding_perf_adapter = args.coding_perf_adapter or str(out_dir / "coding_perf_adapter")
     coding_cost_adapter = args.coding_cost_adapter or str(out_dir / "coding_cost_adapter")
+
+    coding_train_mask = train_profiles["task_domain"].eq("coding").to_numpy()
+    test_coding_mask = test_profiles["task_domain"].eq("coding").to_numpy()
+    val_coding_mask = (
+        val_profiles["task_domain"].eq("coding").to_numpy()
+        if val_profiles is not None
+        else np.zeros(0, dtype=bool)
+    )
+    general_train_mask = ~coding_train_mask
+    test_general_mask = ~test_coding_mask
+    val_general_mask = ~val_coding_mask if val_profiles is not None else np.zeros(0, dtype=bool)
+
+    logger.info(
+        "Hybrid routing split: general_train={}, coding_train={}, general_test={}, coding_test={}",
+        int(general_train_mask.sum()),
+        int(coding_train_mask.sum()),
+        int(test_general_mask.sum()),
+        int(test_coding_mask.sum()),
+    )
+
+    fallback_perf = perf_train.mean(axis=0).to_numpy(dtype=np.float32)
+    fallback_cost_norm = cost_train.mean(axis=0).to_numpy(dtype=np.float32)
+    fallback_scores = compute_irt_reward_scores(
+        fallback_perf[None, :],
+        fallback_cost_norm,
+        alpha=args.alpha,
+        clip_predictions=args.clip_preds,
+    )[0]
+
+    test_reward_scores = np.tile(fallback_scores[None, :], (len(test_df), 1)).astype(np.float32)
+    test_perf_debug = np.tile(fallback_perf[None, :], (len(test_df), 1)).astype(np.float32)
+    test_cost_debug = np.tile(fallback_cost_norm[None, :], (len(test_df), 1)).astype(np.float32)
+    test_sources = np.full(len(test_df), "fallback_train_mean", dtype=object)
+
+    val_reward_scores = None
+    val_perf_debug = None
+    val_cost_debug = None
+    val_sources = None
+    if val_part is not None:
+        val_reward_scores = np.tile(fallback_scores[None, :], (len(val_part), 1)).astype(np.float32)
+        val_perf_debug = np.tile(fallback_perf[None, :], (len(val_part), 1)).astype(np.float32)
+        val_cost_debug = np.tile(fallback_cost_norm[None, :], (len(val_part), 1)).astype(np.float32)
+        val_sources = np.full(len(val_part), "fallback_train_mean", dtype=object)
+
+    general_eval_needed = bool(test_general_mask.any()) or bool(val_general_mask.any())
+    if general_eval_needed:
+        general_train_count = int(general_train_mask.sum())
+        if general_train_count == 0:
+            logger.warning("Skipping MIRT-Router because no non-coding/general training rows were found")
+        else:
+            general_train_part = train_part.loc[general_train_mask].reset_index(drop=True)
+            general_perf_train = perf_train.loc[general_train_mask].reset_index(drop=True)
+            general_cost_train = cost_train.loc[general_train_mask].reset_index(drop=True)
+            general_val_part = (
+                val_part.loc[val_general_mask].reset_index(drop=True)
+                if val_part is not None and val_general_mask.any()
+                else None
+            )
+            general_test_part = test_df.loc[test_general_mask].reset_index(drop=True)
+
+            irt_val_perf_pred, irt_test_perf_pred, irt_fixed_cost_norm = train_or_predict_irt_router(
+                train_df=general_train_part,
+                val_df=general_val_part,
+                test_df=general_test_part,
+                train_perf=general_perf_train,
+                train_cost_norm=general_cost_train,
+                model_names=model_names,
+                args=args,
+                out_dir=out_dir,
+            )
+
+            if test_general_mask.any():
+                test_reward_scores[test_general_mask] = compute_irt_reward_scores(
+                    irt_test_perf_pred,
+                    irt_fixed_cost_norm,
+                    alpha=args.alpha,
+                    clip_predictions=args.clip_preds,
+                )
+                test_perf_debug[test_general_mask] = irt_test_perf_pred
+                test_cost_debug[test_general_mask] = np.tile(
+                    irt_fixed_cost_norm[None, :],
+                    (int(test_general_mask.sum()), 1),
+                )
+                test_sources[test_general_mask] = "general_mirt"
+
+            if (
+                val_reward_scores is not None
+                and val_perf_debug is not None
+                and val_cost_debug is not None
+                and val_sources is not None
+                and val_general_mask.any()
+                and irt_val_perf_pred is not None
+            ):
+                val_reward_scores[val_general_mask] = compute_irt_reward_scores(
+                    irt_val_perf_pred,
+                    irt_fixed_cost_norm,
+                    alpha=args.alpha,
+                    clip_predictions=args.clip_preds,
+                )
+                val_perf_debug[val_general_mask] = irt_val_perf_pred
+                val_cost_debug[val_general_mask] = np.tile(
+                    irt_fixed_cost_norm[None, :],
+                    (int(val_general_mask.sum()), 1),
+                )
+                val_sources[val_general_mask] = "general_mirt"
+
     coding_specialist_available = args.coding_specialist
-    if args.mode == "predict-only" and args.coding_specialist:
+    if args.mode == "predict-only" and args.coding_specialist and not args.coding_direct_model:
         missing_coding_adapters = [
             path for path in [coding_perf_adapter, coding_cost_adapter] if not Path(path).exists()
         ]
@@ -887,67 +1365,27 @@ def main() -> None:
                 ", ".join(missing_coding_adapters),
             )
 
-    train_task_priors = None
-    test_task_priors = None
-    if args.task_aware:
-        train_reward_for_priors = args.alpha * perf_train - (1.0 - args.alpha) * cost_train
-        train_task_priors = build_task_reward_priors(
-            train_profiles,
-            train_reward_for_priors,
-            smoothing=args.task_prior_smoothing,
-        )
-        test_task_priors = build_task_reward_priors(
-            full_profiles,
-            oracle_reward,
-            smoothing=args.task_prior_smoothing,
-        )
-
-    perf_val_pred, perf_test_pred = train_or_predict_one_target(
-        target_name="perf",
-        model_name=args.perf_model,
-        adapter_path=perf_adapter,
-        output_dir=out_dir,
-        train_df=train_part,
-        val_df=val_part,
-        test_df=test_df,
-        train_target=perf_train,
-        val_target=perf_val,
-        models=model_names,
-        args=args,
-        hf_token=hf_token,
-    )
-
-    cost_val_pred, cost_test_pred = train_or_predict_one_target(
-        target_name="cost",
-        model_name=args.cost_model,
-        adapter_path=cost_adapter,
-        output_dir=out_dir,
-        train_df=train_part,
-        val_df=val_part,
-        test_df=test_df,
-        train_target=cost_train,
-        val_target=cost_val,
-        models=model_names,
-        args=args,
-        hf_token=hf_token,
-    )
-
-    coding_train_mask = train_profiles["task_domain"].eq("coding").to_numpy()
-    test_coding_mask = test_profiles["task_domain"].eq("coding").to_numpy()
-    val_coding_mask = val_profiles["task_domain"].eq("coding").to_numpy() if val_profiles is not None else None
     coding_train_count = int(coding_train_mask.sum())
+    coding_eval_needed = bool(test_coding_mask.any()) or bool(val_coding_mask.any())
     should_run_coding_specialist = (
         coding_specialist_available
-        and coding_train_count >= args.min_coding_train_rows
-        and bool(test_coding_mask.any())
+        and coding_eval_needed
+        and (args.coding_direct_model or coding_train_count >= args.min_coding_train_rows)
     )
     if should_run_coding_specialist:
-        logger.info(
-            "Training/predicting coding specialist with {} rows using {} and {}",
-            coding_train_count,
-            args.coding_perf_model,
-            args.coding_cost_model,
-        )
+        if args.coding_direct_model:
+            logger.info(
+                "Predicting coding rows directly with fine-tuned StarCoder checkpoints: {} and {}",
+                args.coding_perf_model,
+                args.coding_cost_model,
+            )
+        else:
+            logger.info(
+                "Training/predicting coding QLoRA adapters with {} rows using {} and {}",
+                coding_train_count,
+                args.coding_perf_model,
+                args.coding_cost_model,
+            )
         coding_train_part = train_part.loc[coding_train_mask].reset_index(drop=True)
         coding_perf_train = perf_train.loc[coding_train_mask].reset_index(drop=True)
         coding_cost_train = cost_train.loc[coding_train_mask].reset_index(drop=True)
@@ -975,6 +1413,7 @@ def main() -> None:
             models=model_names,
             args=args,
             hf_token=hf_token,
+            direct_model=args.coding_direct_model,
         )
 
         coding_cost_val_pred, coding_cost_test_pred = train_or_predict_one_target(
@@ -990,44 +1429,47 @@ def main() -> None:
             models=model_names,
             args=args,
             hf_token=hf_token,
+            direct_model=args.coding_direct_model,
         )
 
-        perf_test_pred = perf_test_pred.copy()
-        cost_test_pred = cost_test_pred.copy()
-        perf_test_pred[test_coding_mask] = coding_perf_test_pred
-        cost_test_pred[test_coding_mask] = coding_cost_test_pred
+        coding_source = "coding_starcoder_direct" if args.coding_direct_model else "coding_starcoder_adapter"
+        if test_coding_mask.any():
+            test_reward_scores[test_coding_mask] = compute_router_scores(
+                perf_pred=coding_perf_test_pred,
+                cost_pred_norm=coding_cost_test_pred,
+                alpha=args.alpha,
+                clip_predictions=args.clip_preds,
+            )
+            test_perf_debug[test_coding_mask] = coding_perf_test_pred
+            test_cost_debug[test_coding_mask] = coding_cost_test_pred
+            test_sources[test_coding_mask] = coding_source
 
         if (
-            perf_val_pred is not None
-            and cost_val_pred is not None
-            and val_coding_mask is not None
+            val_reward_scores is not None
+            and val_perf_debug is not None
+            and val_cost_debug is not None
+            and val_sources is not None
             and val_coding_mask.any()
             and coding_perf_val_pred is not None
             and coding_cost_val_pred is not None
         ):
-            perf_val_pred = perf_val_pred.copy()
-            cost_val_pred = cost_val_pred.copy()
-            perf_val_pred[val_coding_mask] = coding_perf_val_pred
-            cost_val_pred[val_coding_mask] = coding_cost_val_pred
+            val_reward_scores[val_coding_mask] = compute_router_scores(
+                perf_pred=coding_perf_val_pred,
+                cost_pred_norm=coding_cost_val_pred,
+                alpha=args.alpha,
+                clip_predictions=args.clip_preds,
+            )
+            val_perf_debug[val_coding_mask] = coding_perf_val_pred
+            val_cost_debug[val_coding_mask] = coding_cost_val_pred
+            val_sources[val_coding_mask] = coding_source
     elif args.coding_specialist:
         logger.info(
-            "Skipping coding specialist: coding_train_rows={}, test_coding_rows={}",
+            "Skipping coding StarCoder path: coding_train_rows={}, test_coding_rows={}",
             coding_train_count,
             int(test_coding_mask.sum()),
         )
 
-    if perf_val_pred is not None and cost_val_pred is not None and len(val_idx):
-        val_reward_scores = compute_router_scores(
-            perf_pred=perf_val_pred,
-            cost_pred_norm=cost_val_pred,
-            alpha=args.alpha,
-            clip_predictions=args.clip_preds,
-            task_profiles=val_profiles if args.task_aware else None,
-            task_reward_priors=train_task_priors,
-            task_prior_weight=args.task_prior_weight if args.task_aware else 0.0,
-            coding_task_prior_weight=args.coding_task_prior_weight,
-            task_prior_min_count=args.task_prior_min_count,
-        )
+    if val_reward_scores is not None and len(val_idx):
         val_preds = models_from_scores(val_reward_scores, model_names)
         val_perf = perf.iloc[val_idx].reset_index(drop=True)
         val_cost = cost.iloc[val_idx].reset_index(drop=True)
@@ -1046,10 +1488,11 @@ def main() -> None:
                 "val",
                 train_df.iloc[val_idx]["ID"].reset_index(drop=True),
                 model_names,
-                perf_val_pred,
-                cost_val_pred,
+                val_perf_debug,
+                val_cost_debug,
                 val_preds,
                 task_profiles=val_profiles,
+                router_sources=val_sources,
             )
         if args.save_val_reward_scores:
             save_reward_scores(
@@ -1059,17 +1502,6 @@ def main() -> None:
                 val_reward_scores,
             )
 
-    test_reward_scores = compute_router_scores(
-        perf_pred=perf_test_pred,
-        cost_pred_norm=cost_test_pred,
-        alpha=args.alpha,
-        clip_predictions=args.clip_preds,
-        task_profiles=test_profiles if args.task_aware else None,
-        task_reward_priors=test_task_priors,
-        task_prior_weight=args.task_prior_weight if args.task_aware else 0.0,
-        coding_task_prior_weight=args.coding_task_prior_weight,
-        task_prior_min_count=args.task_prior_min_count,
-    )
     test_preds = models_from_scores(test_reward_scores, model_names)
     make_submission(test_df, test_preds, args.out)
     logger.info("Saved submission to {}", args.out)
@@ -1084,10 +1516,11 @@ def main() -> None:
             "test",
             test_df["ID"],
             model_names,
-            perf_test_pred,
-            cost_test_pred,
+            test_perf_debug,
+            test_cost_debug,
             test_preds,
             task_profiles=test_profiles,
+            router_sources=test_sources,
         )
 
 
