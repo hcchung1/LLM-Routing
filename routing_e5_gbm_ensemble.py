@@ -200,6 +200,72 @@ def train_reward_regressor(
     return reg.predict(x_test).astype(np.float32)
 
 
+def get_xgboost_classes():
+    try:
+        from xgboost import XGBClassifier, XGBRegressor
+    except ImportError as exc:
+        raise SystemExit("xgboost is required for --backend xgboost. Install it with `pip install xgboost`.") from exc
+    return XGBClassifier, XGBRegressor
+
+
+def train_xgboost_classifier(
+    x_train: np.ndarray,
+    y: np.ndarray,
+    x_test: np.ndarray,
+    n_classes: int,
+    args,
+) -> np.ndarray:
+    XGBClassifier, _ = get_xgboost_classes()
+    logger.info("Training XGBClassifier on {}", args.xgb_device)
+    model = XGBClassifier(
+        n_estimators=args.xgb_estimators,
+        max_depth=args.xgb_depth,
+        learning_rate=args.xgb_lr,
+        subsample=args.xgb_subsample,
+        colsample_bytree=args.xgb_colsample,
+        max_bin=args.xgb_max_bin,
+        objective="multi:softprob",
+        num_class=n_classes,
+        tree_method="hist",
+        device=args.xgb_device,
+        eval_metric="mlogloss",
+        random_state=args.seed,
+        n_jobs=args.xgb_n_jobs,
+    )
+    model.fit(x_train, y)
+    return model.predict_proba(x_test).astype(np.float32)
+
+
+def train_xgboost_reward_regressor(
+    x_train: np.ndarray,
+    reward: np.ndarray,
+    x_test: np.ndarray,
+    model_names: List[str],
+    args,
+) -> np.ndarray:
+    _, XGBRegressor = get_xgboost_classes()
+    preds = np.zeros((x_test.shape[0], reward.shape[1]), dtype=np.float32)
+    for idx, model_name in enumerate(model_names):
+        logger.info("Training XGBRegressor for {} on {}", model_name, args.xgb_device)
+        reg = XGBRegressor(
+            n_estimators=args.xgb_reg_estimators,
+            max_depth=args.xgb_reg_depth,
+            learning_rate=args.xgb_reg_lr,
+            subsample=args.xgb_subsample,
+            colsample_bytree=args.xgb_colsample,
+            max_bin=args.xgb_max_bin,
+            objective="reg:squarederror",
+            tree_method="hist",
+            device=args.xgb_device,
+            eval_metric="rmse",
+            random_state=args.seed + idx,
+            n_jobs=args.xgb_n_jobs,
+        )
+        reg.fit(x_train, reward[:, idx])
+        preds[:, idx] = reg.predict(x_test).astype(np.float32)
+    return preds
+
+
 def save_score_npz(out_path: str, scores: np.ndarray, ids: pd.Series, model_names: List[str]) -> None:
     path = Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,6 +286,12 @@ def main() -> None:
     parser.add_argument("--reward-out", default="e5_gbm_reward.npz")
     parser.add_argument("--metadata-out", default="e5_gbm_metadata.json")
     parser.add_argument("--embedding-model", default="intfloat/e5-large-v2")
+    parser.add_argument(
+        "--backend",
+        default="sklearn",
+        choices=["sklearn", "xgboost"],
+        help="sklearn uses CPU GBM/RF/LR; xgboost uses GPU-capable XGBoost trees.",
+    )
     parser.add_argument("--cache-dir", default="e5_embedding_cache")
     parser.add_argument("--no-cache", dest="use_cache", action="store_false")
     parser.add_argument("--device", default="", help="SentenceTransformer device, e.g. cpu or cuda.")
@@ -241,6 +313,17 @@ def main() -> None:
     parser.add_argument("--reg-lr", type=float, default=0.05)
     parser.add_argument("--reg-n-jobs", type=int, default=-1)
     parser.add_argument("--n-jobs", type=int, default=-1)
+    parser.add_argument("--xgb-device", default="cuda")
+    parser.add_argument("--xgb-estimators", type=int, default=500)
+    parser.add_argument("--xgb-depth", type=int, default=5)
+    parser.add_argument("--xgb-lr", type=float, default=0.05)
+    parser.add_argument("--xgb-reg-estimators", type=int, default=300)
+    parser.add_argument("--xgb-reg-depth", type=int, default=4)
+    parser.add_argument("--xgb-reg-lr", type=float, default=0.05)
+    parser.add_argument("--xgb-subsample", type=float, default=0.9)
+    parser.add_argument("--xgb-colsample", type=float, default=0.9)
+    parser.add_argument("--xgb-max-bin", type=int, default=256)
+    parser.add_argument("--xgb-n-jobs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int, default=0, help="Smoke-test limit for train/test rows.")
     parser.add_argument("--no-reward-regression", dest="reward_regression", action="store_false")
@@ -258,7 +341,10 @@ def main() -> None:
 
     x_train, x_test = encode_queries(train_df, test_df, args)
 
-    prob = train_classifier_ensemble(x_train, y, x_test, len(model_names), args)
+    if args.backend == "xgboost":
+        prob = train_xgboost_classifier(x_train, y, x_test, len(model_names), args)
+    else:
+        prob = train_classifier_ensemble(x_train, y, x_test, len(model_names), args)
     preds = [model_names[idx] for idx in prob.argmax(axis=1)]
     make_submission(test_df, preds, args.out)
     logger.info("Saved scheme-1 submission to {}", args.out)
@@ -268,7 +354,10 @@ def main() -> None:
         logger.info("Saved classifier probabilities to {}", args.prob_out)
 
     if args.reward_regression:
-        pred_reward = train_reward_regressor(x_train, reward_array, x_test, args)
+        if args.backend == "xgboost":
+            pred_reward = train_xgboost_reward_regressor(x_train, reward_array, x_test, model_names, args)
+        else:
+            pred_reward = train_reward_regressor(x_train, reward_array, x_test, args)
         save_score_npz(args.reward_out, pred_reward, test_df["ID"], model_names)
         logger.info("Saved reward-regression scores to {}", args.reward_out)
 
