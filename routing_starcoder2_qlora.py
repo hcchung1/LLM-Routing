@@ -20,6 +20,7 @@ from sklearn.preprocessing import normalize
 from torch import nn
 from tqdm import tqdm
 from transformers import (
+    AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     BitsAndBytesConfig,
@@ -736,6 +737,16 @@ def load_tokenizer(model_name: str, hf_token: Optional[str]) -> AutoTokenizer:
     return tokenizer
 
 
+def checkpoint_num_labels(model_name: str, hf_token: Optional[str]) -> Optional[int]:
+    try:
+        config = AutoConfig.from_pretrained(model_name, token=hf_token)
+    except Exception as exc:
+        logger.warning("Could not read config for {}: {}", model_name, exc)
+        return None
+    num_labels = getattr(config, "num_labels", None)
+    return int(num_labels) if num_labels is not None else None
+
+
 def build_bnb_config(args) -> Optional[BitsAndBytesConfig]:
     if not args.load_in_4bit:
         return None
@@ -800,9 +811,8 @@ def load_sequence_regressor(
     args,
     hf_token: Optional[str],
     for_training: bool,
+    direct_model: bool = False,
 ):
-    id2label = {idx: name for idx, name in enumerate(models)}
-    label2id = {name: idx for idx, name in id2label.items()}
     quant_config = build_bnb_config(args)
 
     max_memory = None
@@ -811,16 +821,28 @@ def load_sequence_regressor(
 
     model_kwargs = dict(
         token=hf_token,
-        num_labels=len(models),
-        id2label=id2label,
-        label2id=label2id,
         problem_type="regression",
-        ignore_mismatched_sizes=True,
         quantization_config=quant_config,
         device_map="auto" if torch.cuda.is_available() else None,
         max_memory=max_memory,
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
     )
+    if direct_model:
+        num_labels = checkpoint_num_labels(model_name, hf_token)
+        if num_labels != len(models):
+            raise ValueError(
+                f"{model_name} has num_labels={num_labels}, but this dataset has {len(models)} candidate models. "
+                "Direct checkpoint inference is not valid for this label space."
+            )
+    else:
+        id2label = {idx: name for idx, name in enumerate(models)}
+        label2id = {name: idx for idx, name in id2label.items()}
+        model_kwargs.update(
+            num_labels=len(models),
+            id2label=id2label,
+            label2id=label2id,
+            ignore_mismatched_sizes=True,
+        )
     if args.attn_implementation:
         model_kwargs["attn_implementation"] = args.attn_implementation
 
@@ -863,6 +885,32 @@ def compute_regression_metrics(eval_pred):
     mse = float(np.mean((predictions - labels) ** 2))
     mae = float(np.mean(np.abs(predictions - labels)))
     return {"mse": mse, "mae": mae}
+
+
+def predict_with_quantized_model(
+    model,
+    dataset: Optional[Dataset],
+    data_collator: RegressionDataCollator,
+    batch_size: int,
+    n_models: int,
+    desc: str,
+) -> Optional[np.ndarray]:
+    if dataset is None:
+        return np.empty((0, n_models), dtype=np.float32)
+
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, collate_fn=data_collator)
+    device = next(model.parameters()).device
+    model.eval()
+    preds = []
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc=desc):
+            batch = {
+                key: value.to(device) if torch.is_tensor(value) else value
+                for key, value in batch.items()
+            }
+            outputs = model(**batch)
+            preds.append(outputs.logits.detach().float().cpu().numpy())
+    return np.vstack(preds).astype(np.float32) if preds else np.empty((0, n_models), dtype=np.float32)
 
 
 def train_or_predict_one_target(
@@ -931,6 +979,7 @@ def train_or_predict_one_target(
         args=args,
         hf_token=hf_token,
         for_training=args.mode == "train-predict" and not direct_model,
+        direct_model=direct_model,
     )
 
     if direct_model:
@@ -944,6 +993,34 @@ def train_or_predict_one_target(
         model = PeftModel.from_pretrained(model, adapter_path)
 
     data_collator = RegressionDataCollator(tokenizer)
+    if direct_model:
+        val_predictions = None
+        if val_ds is not None:
+            logger.info("Predicting {} validation scores without Trainer", target_name)
+            val_predictions = predict_with_quantized_model(
+                model,
+                val_ds,
+                data_collator,
+                args.eval_batch_size,
+                len(models),
+                desc=f"Predicting {target_name} val",
+            )
+
+        test_predictions = predict_with_quantized_model(
+            model,
+            test_ds,
+            data_collator,
+            args.eval_batch_size,
+            len(models),
+            desc=f"Predicting {target_name} test",
+        )
+
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return val_predictions, test_predictions
+
     training_args = make_training_args(
         args,
         output_dir=str(output_dir / f"{target_name}_trainer"),
@@ -1266,6 +1343,22 @@ def main() -> None:
         int(test_general_mask.sum()),
         int(test_coding_mask.sum()),
     )
+    coding_train_count = int(coding_train_mask.sum())
+    coding_eval_needed = bool(test_coding_mask.any()) or bool(val_coding_mask.any())
+    use_coding_direct_model = args.coding_direct_model
+    if args.coding_specialist and args.coding_direct_model and coding_eval_needed:
+        coding_perf_labels = checkpoint_num_labels(args.coding_perf_model, hf_token)
+        coding_cost_labels = checkpoint_num_labels(args.coding_cost_model, hf_token)
+        if coding_perf_labels != len(model_names) or coding_cost_labels != len(model_names):
+            use_coding_direct_model = False
+            logger.warning(
+                "Disabling direct StarCoder coding inference because checkpoint heads do not match this dataset: "
+                "perf num_labels={}, cost num_labels={}, expected={}. "
+                "Falling back to coding-only QLoRA adapter training/loading.",
+                coding_perf_labels,
+                coding_cost_labels,
+                len(model_names),
+            )
 
     fallback_perf = perf_train.mean(axis=0).to_numpy(dtype=np.float32)
     fallback_cost_norm = cost_train.mean(axis=0).to_numpy(dtype=np.float32)
@@ -1354,7 +1447,7 @@ def main() -> None:
                 val_sources[val_general_mask] = "general_mirt"
 
     coding_specialist_available = args.coding_specialist
-    if args.mode == "predict-only" and args.coding_specialist and not args.coding_direct_model:
+    if args.mode == "predict-only" and args.coding_specialist and not use_coding_direct_model:
         missing_coding_adapters = [
             path for path in [coding_perf_adapter, coding_cost_adapter] if not Path(path).exists()
         ]
@@ -1365,15 +1458,13 @@ def main() -> None:
                 ", ".join(missing_coding_adapters),
             )
 
-    coding_train_count = int(coding_train_mask.sum())
-    coding_eval_needed = bool(test_coding_mask.any()) or bool(val_coding_mask.any())
     should_run_coding_specialist = (
         coding_specialist_available
         and coding_eval_needed
-        and (args.coding_direct_model or coding_train_count >= args.min_coding_train_rows)
+        and (use_coding_direct_model or coding_train_count >= args.min_coding_train_rows)
     )
     if should_run_coding_specialist:
-        if args.coding_direct_model:
+        if use_coding_direct_model:
             logger.info(
                 "Predicting coding rows directly with fine-tuned StarCoder checkpoints: {} and {}",
                 args.coding_perf_model,
@@ -1413,7 +1504,7 @@ def main() -> None:
             models=model_names,
             args=args,
             hf_token=hf_token,
-            direct_model=args.coding_direct_model,
+            direct_model=use_coding_direct_model,
         )
 
         coding_cost_val_pred, coding_cost_test_pred = train_or_predict_one_target(
@@ -1429,10 +1520,10 @@ def main() -> None:
             models=model_names,
             args=args,
             hf_token=hf_token,
-            direct_model=args.coding_direct_model,
+            direct_model=use_coding_direct_model,
         )
 
-        coding_source = "coding_starcoder_direct" if args.coding_direct_model else "coding_starcoder_adapter"
+        coding_source = "coding_starcoder_direct" if use_coding_direct_model else "coding_starcoder_adapter"
         if test_coding_mask.any():
             test_reward_scores[test_coding_mask] = compute_router_scores(
                 perf_pred=coding_perf_test_pred,
