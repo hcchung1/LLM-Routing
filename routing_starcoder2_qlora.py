@@ -223,7 +223,59 @@ def irt_artifact_paths(args, out_dir: Path) -> Tuple[Path, Path]:
     return router_path, feature_path
 
 
-def fit_query_embedder(texts: List[str], args):
+_SENTENCE_TRANSFORMER_CACHE = {}
+
+
+def sentence_transformer_device(requested_device: str) -> Optional[str]:
+    return requested_device.strip() or None
+
+
+def should_use_e5_query_prefix(model_name: str, use_prefix: bool) -> bool:
+    return use_prefix and "e5" in model_name.lower()
+
+
+def prepare_sentence_transformer_texts(texts: List[str], model_name: str, use_e5_prefix: bool) -> List[str]:
+    if not should_use_e5_query_prefix(model_name, use_e5_prefix):
+        return texts
+    return [text if text.startswith("query: ") else f"query: {text}" for text in texts]
+
+
+def load_sentence_transformer(model_name: str, device: Optional[str]):
+    cache_key = (model_name, device or "auto")
+    if cache_key not in _SENTENCE_TRANSFORMER_CACHE:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise ImportError(
+                "sentence-transformers is required for --irt-embedding-backend sentence-transformer"
+            ) from exc
+        logger.info("Loading sentence-transformer query embedder: {}", model_name)
+        if device:
+            _SENTENCE_TRANSFORMER_CACHE[cache_key] = SentenceTransformer(model_name, device=device)
+        else:
+            _SENTENCE_TRANSFORMER_CACHE[cache_key] = SentenceTransformer(model_name)
+    return _SENTENCE_TRANSFORMER_CACHE[cache_key]
+
+
+def encode_sentence_transformer_embeddings(texts: List[str], embedder: Dict[str, object]) -> np.ndarray:
+    model_name = str(embedder["model_name"])
+    prepared_texts = prepare_sentence_transformer_texts(
+        texts,
+        model_name=model_name,
+        use_e5_prefix=bool(embedder.get("e5_query_prefix", True)),
+    )
+    model = load_sentence_transformer(model_name, embedder.get("device"))
+    embeddings = model.encode(
+        prepared_texts,
+        batch_size=int(embedder.get("batch_size", 64)),
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
+    return np.asarray(embeddings, dtype=np.float32)
+
+
+def fit_tfidf_query_embedder(texts: List[str], args):
     vectorizer = TfidfVectorizer(
         analyzer=args.irt_tfidf_analyzer,
         ngram_range=(args.irt_tfidf_ngram_min, args.irt_tfidf_ngram_max),
@@ -252,15 +304,39 @@ def fit_query_embedder(texts: List[str], args):
         embeddings = features.toarray()
 
     embeddings = normalize(np.asarray(embeddings, dtype=np.float32))
-    return {"vectorizer": vectorizer, "svd": svd}, embeddings.astype(np.float32)
+    return {"backend": "tfidf", "vectorizer": vectorizer, "svd": svd}, embeddings.astype(np.float32)
 
 
-def transform_query_embeddings(embedder, texts: List[str]) -> np.ndarray:
+def transform_tfidf_query_embeddings(embedder, texts: List[str]) -> np.ndarray:
     features = embedder["vectorizer"].transform(texts)
     svd = embedder.get("svd")
     embeddings = svd.transform(features) if svd is not None else features.toarray()
     embeddings = normalize(np.asarray(embeddings, dtype=np.float32))
     return embeddings.astype(np.float32)
+
+
+def fit_query_embedder(texts: List[str], args):
+    if args.irt_embedding_backend == "tfidf":
+        return fit_tfidf_query_embedder(texts, args)
+
+    embedder = {
+        "backend": "sentence-transformer",
+        "model_name": args.irt_embedding_model,
+        "batch_size": args.irt_st_batch_size,
+        "device": sentence_transformer_device(args.irt_st_device),
+        "e5_query_prefix": args.irt_e5_query_prefix,
+    }
+    embeddings = encode_sentence_transformer_embeddings(texts, embedder)
+    return embedder, embeddings.astype(np.float32)
+
+
+def transform_query_embeddings(embedder, texts: List[str]) -> np.ndarray:
+    backend = embedder.get("backend", "tfidf")
+    if backend == "tfidf":
+        return transform_tfidf_query_embeddings(embedder, texts)
+    if backend == "sentence-transformer":
+        return encode_sentence_transformer_embeddings(texts, embedder)
+    raise ValueError(f"Unknown IRT embedding backend in artifact: {backend}")
 
 
 def warm_up_query_embeddings(
@@ -475,7 +551,11 @@ def train_or_predict_irt_router(
 ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:
     router_path, feature_path = irt_artifact_paths(args, out_dir)
     if args.mode == "train-predict":
-        logger.info("Fitting MIRT query embeddings on {} general rows", len(train_df))
+        logger.info(
+            "Fitting MIRT query embeddings on {} general rows with backend={}",
+            len(train_df),
+            args.irt_embedding_backend,
+        )
         embedder, train_embeddings = fit_query_embedder(train_df["query"].astype(str).tolist(), args)
         fixed_cost_norm = fixed_model_cost_from_train(train_cost_norm)
         logger.info(
@@ -1255,6 +1335,25 @@ def main() -> None:
     parser.add_argument("--irt-max-grad-norm", type=float, default=1.0)
     parser.add_argument("--irt-warmup-k", type=int, default=5)
     parser.add_argument("--irt-warmup-lambda", type=float, default=0.2)
+    parser.add_argument(
+        "--irt-embedding-backend",
+        default="sentence-transformer",
+        choices=["sentence-transformer", "tfidf"],
+        help="Query embedding backend for MIRT-Router.",
+    )
+    parser.add_argument(
+        "--irt-embedding-model",
+        default="intfloat/e5-base-v2",
+        help="SentenceTransformer model used when --irt-embedding-backend sentence-transformer.",
+    )
+    parser.add_argument("--irt-st-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--irt-st-device",
+        default="",
+        help="Optional device for SentenceTransformer, e.g. cuda, cuda:0, or cpu. Empty lets it choose.",
+    )
+    parser.add_argument("--irt-e5-query-prefix", action="store_true", default=True)
+    parser.add_argument("--no-irt-e5-query-prefix", dest="irt_e5_query_prefix", action="store_false")
     parser.add_argument("--irt-tfidf-analyzer", default="char_wb", choices=["word", "char", "char_wb"])
     parser.add_argument("--irt-tfidf-ngram-min", type=int, default=3)
     parser.add_argument("--irt-tfidf-ngram-max", type=int, default=5)
@@ -1278,8 +1377,10 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    if args.irt_tfidf_ngram_min > args.irt_tfidf_ngram_max:
+    if args.irt_embedding_backend == "tfidf" and args.irt_tfidf_ngram_min > args.irt_tfidf_ngram_max:
         raise ValueError("--irt-tfidf-ngram-min must be <= --irt-tfidf-ngram-max")
+    if args.irt_st_batch_size <= 0:
+        raise ValueError("--irt-st-batch-size must be positive")
     if not 0.0 <= args.irt_warmup_lambda <= 1.0:
         raise ValueError("--irt-warmup-lambda must be in [0, 1]")
     if args.task_aware:
