@@ -1,5 +1,6 @@
 import argparse
 import re
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -68,7 +69,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--knn-weight", type=float, default=0.70)
     parser.add_argument("--prior-smoothing", type=float, default=20.0)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--score-out", default="", help="Optional .npz path for test reward scores.")
     parser.add_argument("--cv", action="store_true")
+    parser.add_argument("--cv-repeats", type=int, default=1)
+    parser.add_argument(
+        "--cv-seeds",
+        default="",
+        help="Comma-separated CV seeds. Overrides --cv-repeats when set.",
+    )
     parser.add_argument("--val-size", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -205,7 +213,7 @@ def knn_reward_scores(
     return scores
 
 
-def predict_router(
+def router_scores(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     reward_df: pd.DataFrame,
@@ -222,7 +230,29 @@ def predict_router(
 
     knn_scores = knn_reward_scores(train_df[text_col], test_df[text_col], reward, k, batch_size)
     prior_scores = lookup_priors(test_tasks, priors, global_prior)
-    final_scores = knn_weight * knn_scores + (1.0 - knn_weight) * prior_scores
+    return (knn_weight * knn_scores + (1.0 - knn_weight) * prior_scores).astype(np.float32)
+
+
+def predict_router(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    reward_df: pd.DataFrame,
+    text_col: str,
+    k: int,
+    knn_weight: float,
+    prior_smoothing: float,
+    batch_size: int,
+) -> List[str]:
+    final_scores = router_scores(
+        train_df,
+        test_df,
+        reward_df,
+        text_col,
+        k,
+        knn_weight,
+        prior_smoothing,
+        batch_size,
+    )
     best_idx = final_scores.argmax(axis=1)
     return [reward_df.columns[idx] for idx in best_idx]
 
@@ -233,12 +263,24 @@ def evaluate_reward(reward_df: pd.DataFrame, preds: List[str]) -> float:
     return float(reward_df.to_numpy(dtype=np.float32)[row_idx, col_idx].mean())
 
 
-def run_cv(train_df: pd.DataFrame, reward_df: pd.DataFrame, args: argparse.Namespace) -> None:
+def parse_cv_seeds(raw: str, seed: int, repeats: int) -> List[int]:
+    if raw.strip():
+        return [int(part.strip()) for part in raw.split(",") if part.strip()]
+    repeats = max(1, repeats)
+    return [seed + offset for offset in range(repeats)]
+
+
+def run_one_cv_split(
+    train_df: pd.DataFrame,
+    reward_df: pd.DataFrame,
+    args: argparse.Namespace,
+    seed: int,
+) -> float:
     text_col = find_text_column(train_df)
     train_idx, val_idx = train_test_split(
         np.arange(len(train_df)),
         test_size=args.val_size,
-        random_state=args.seed,
+        random_state=seed,
         shuffle=True,
     )
     fit_df = train_df.iloc[train_idx].reset_index(drop=True)
@@ -256,14 +298,45 @@ def run_cv(train_df: pd.DataFrame, reward_df: pd.DataFrame, args: argparse.Names
         args.prior_smoothing,
         args.batch_size,
     )
-    score = evaluate_reward(val_reward, preds)
-    print(f"Local Reward_{args.alpha:.2f}: {score:.6f}")
+    return evaluate_reward(val_reward, preds)
+
+
+def run_cv(train_df: pd.DataFrame, reward_df: pd.DataFrame, args: argparse.Namespace) -> None:
+    seeds = parse_cv_seeds(args.cv_seeds, args.seed, args.cv_repeats)
+    scores = []
+    for seed in seeds:
+        score = run_one_cv_split(train_df, reward_df, args, seed)
+        scores.append(score)
+        print(f"Local Reward_{args.alpha:.2f} seed={seed}: {score:.6f}")
+
+    values = np.array(scores, dtype=np.float32)
+    print(
+        "Local Reward_{:.2f} summary: mean={:.6f} std={:.6f} min={:.6f} max={:.6f} n={}".format(
+            args.alpha,
+            float(values.mean()),
+            float(values.std(ddof=0)),
+            float(values.min()),
+            float(values.max()),
+            len(values),
+        )
+    )
 
 
 def write_submission(test_df: pd.DataFrame, preds: List[str], out_path: str) -> None:
     if "ID" not in test_df.columns:
         raise ValueError("test.csv must contain an ID column.")
     pd.DataFrame({"ID": test_df["ID"], "pred_model": preds}).to_csv(out_path, index=False)
+
+
+def save_score_npz(out_path: str, scores: np.ndarray, ids: pd.Series, model_names: List[str]) -> None:
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        scores=scores.astype(np.float32),
+        ids=ids.to_numpy(),
+        model_names=np.array(model_names),
+    )
 
 
 def main() -> None:
@@ -281,7 +354,7 @@ def main() -> None:
     if text_col not in test_df.columns:
         raise ValueError(f"test.csv is missing text column {text_col!r}.")
 
-    preds = predict_router(
+    scores = router_scores(
         train_df,
         test_df,
         reward_df,
@@ -291,7 +364,11 @@ def main() -> None:
         args.prior_smoothing,
         args.batch_size,
     )
+    preds = [reward_df.columns[idx] for idx in scores.argmax(axis=1)]
     write_submission(test_df, preds, args.out)
+    if args.score_out:
+        save_score_npz(args.score_out, scores, test_df["ID"], list(reward_df.columns))
+        print(f"Wrote {args.score_out} with score shape {scores.shape}.")
     print(f"Wrote {args.out} with {len(preds)} rows.")
 
 

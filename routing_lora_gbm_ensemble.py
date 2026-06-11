@@ -96,6 +96,42 @@ def scale_scores(scores: np.ndarray, method: str) -> np.ndarray:
     raise ValueError(f"Unknown scale method: {method}")
 
 
+def parse_weights(raw: str, n_scores: int) -> np.ndarray:
+    if raw.strip():
+        weights = np.array([float(part.strip()) for part in raw.split(",") if part.strip()], dtype=np.float32)
+        if len(weights) != n_scores:
+            raise ValueError(f"--weights provides {len(weights)} values, expected {n_scores}.")
+    else:
+        weights = np.ones(n_scores, dtype=np.float32)
+    total = float(weights.sum())
+    if total <= 0:
+        raise ValueError("Score weights must sum to a positive value.")
+    return weights / total
+
+
+def blend_score_files(
+    score_files: List[str],
+    weights: np.ndarray,
+    model_names: List[str],
+    test_rows: int,
+    scale: str,
+) -> np.ndarray:
+    final_scores = None
+    for idx, score_file in enumerate(score_files):
+        scores, source_models = load_scores(score_file, model_names)
+        scores = align_scores(scores, source_models, model_names, f"score_file_{idx}")
+        if len(scores) != test_rows:
+            raise ValueError(f"{score_file} has {len(scores)} rows, expected {test_rows}.")
+        scaled_scores = scale_scores(scores, scale)
+        if final_scores is None:
+            final_scores = weights[idx] * scaled_scores
+        else:
+            final_scores = final_scores + weights[idx] * scaled_scores
+    if final_scores is None:
+        raise ValueError("No score files were provided.")
+    return final_scores.astype(np.float32)
+
+
 def make_submission(test_df: pd.DataFrame, preds: List[str], out_path: str) -> None:
     pd.DataFrame({"ID": test_df["ID"], "pred_model": preds}).to_csv(out_path, index=False)
 
@@ -110,29 +146,37 @@ def main() -> None:
     parser.add_argument("--final-score-out", default="lora_gbm_final_scores.npz")
     parser.add_argument("--starcoder-weight", type=float, default=0.5)
     parser.add_argument("--gbm-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--score-files",
+        nargs="*",
+        default=[],
+        help="Optional generic score files. When set, these replace --starcoder-reward/--gbm-reward.",
+    )
+    parser.add_argument(
+        "--weights",
+        default="",
+        help="Comma-separated weights for --score-files. Defaults to equal weights.",
+    )
     parser.add_argument("--scale", default="minmax", choices=["minmax", "none"])
     args = parser.parse_args()
 
     _, test_df, model_names = load_reference(args.train, args.test)
-    starcoder_scores, starcoder_models = load_scores(args.starcoder_reward, model_names)
-    gbm_scores, gbm_models = load_scores(args.gbm_reward, model_names)
+    if args.score_files:
+        weights = parse_weights(args.weights, len(args.score_files))
+        final_scores = blend_score_files(
+            args.score_files,
+            weights,
+            model_names,
+            len(test_df),
+            args.scale,
+        )
+        logger.info("Blended {} generic score files with weights {}", len(args.score_files), weights.tolist())
+    else:
+        score_files = [args.starcoder_reward, args.gbm_reward]
+        weights = parse_weights(f"{args.starcoder_weight},{args.gbm_weight}", len(score_files))
+        final_scores = blend_score_files(score_files, weights, model_names, len(test_df), args.scale)
+        logger.info("Blended legacy StarCoder/GBM scores with weights {}", weights.tolist())
 
-    starcoder_scores = align_scores(starcoder_scores, starcoder_models, model_names, "starcoder")
-    gbm_scores = align_scores(gbm_scores, gbm_models, model_names, "gbm")
-    if starcoder_scores.shape != gbm_scores.shape:
-        raise ValueError(f"Score shapes differ: {starcoder_scores.shape} vs {gbm_scores.shape}")
-    if len(test_df) != starcoder_scores.shape[0]:
-        raise ValueError(f"Test rows={len(test_df)} but score rows={starcoder_scores.shape[0]}")
-
-    total_weight = args.starcoder_weight + args.gbm_weight
-    if total_weight <= 0:
-        raise ValueError("Weights must sum to a positive number.")
-    starcoder_weight = args.starcoder_weight / total_weight
-    gbm_weight = args.gbm_weight / total_weight
-
-    s1 = scale_scores(starcoder_scores, args.scale)
-    s2 = scale_scores(gbm_scores, args.scale)
-    final_scores = starcoder_weight * s1 + gbm_weight * s2
     preds = [model_names[idx] for idx in final_scores.argmax(axis=1)]
     make_submission(test_df, preds, args.out)
     logger.info("Saved scheme-3 submission to {}", args.out)

@@ -234,10 +234,28 @@ def should_use_e5_query_prefix(model_name: str, use_prefix: bool) -> bool:
     return use_prefix and "e5" in model_name.lower()
 
 
-def prepare_sentence_transformer_texts(texts: List[str], model_name: str, use_e5_prefix: bool) -> List[str]:
-    if not should_use_e5_query_prefix(model_name, use_e5_prefix):
-        return texts
-    return [text if text.startswith("query: ") else f"query: {text}" for text in texts]
+def should_use_bge_query_prefix(model_name: str, use_prefix: bool) -> bool:
+    lowered = model_name.lower()
+    return use_prefix and ("bge" in lowered or "baai/" in lowered)
+
+
+def prepare_sentence_transformer_texts(
+    texts: List[str],
+    model_name: str,
+    use_e5_prefix: bool,
+    use_bge_prefix: bool,
+) -> List[str]:
+    use_e5 = should_use_e5_query_prefix(model_name, use_e5_prefix)
+    use_bge = should_use_bge_query_prefix(model_name, use_bge_prefix)
+
+    if use_e5 and use_bge:
+        logger.warning("Both e5 and bge query prefixes matched {}; using e5 prefix", model_name)
+    if use_e5:
+        return [text if text.startswith("query: ") else f"query: {text}" for text in texts]
+    if use_bge:
+        prefix = "Represent this sentence for searching relevant passages: "
+        return [text if text.startswith(prefix) else f"{prefix}{text}" for text in texts]
+    return texts
 
 
 def load_sentence_transformer(model_name: str, device: Optional[str]):
@@ -263,6 +281,7 @@ def encode_sentence_transformer_embeddings(texts: List[str], embedder: Dict[str,
         texts,
         model_name=model_name,
         use_e5_prefix=bool(embedder.get("e5_query_prefix", True)),
+        use_bge_prefix=bool(embedder.get("bge_query_prefix", True)),
     )
     model = load_sentence_transformer(model_name, embedder.get("device"))
     embeddings = model.encode(
@@ -325,6 +344,7 @@ def fit_query_embedder(texts: List[str], args):
         "batch_size": args.irt_st_batch_size,
         "device": sentence_transformer_device(args.irt_st_device),
         "e5_query_prefix": args.irt_e5_query_prefix,
+        "bge_query_prefix": args.irt_bge_query_prefix,
     }
     embeddings = encode_sentence_transformer_embeddings(texts, embedder)
     return embedder, embeddings.astype(np.float32)
@@ -381,20 +401,69 @@ class MIRTRouter(nn.Module):
         return torch.sum(discrimination * ability, dim=-1) - difficulty
 
 
+class NIRTRouter(nn.Module):
+    def __init__(self, query_dim: int, n_models: int, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.query_dim = query_dim
+        self.n_models = n_models
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        self.query_encoder = nn.Sequential(
+            nn.Linear(query_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+        self.model_ability = nn.Embedding(n_models, hidden_dim)
+        self.response_net = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.normal_(self.model_ability.weight, mean=0.0, std=0.02)
+
+    def forward(self, query_embeddings: torch.Tensor, model_ids: torch.Tensor) -> torch.Tensor:
+        query_hidden = self.query_encoder(query_embeddings)
+        ability = self.model_ability(model_ids)
+        features = torch.cat([query_hidden, ability, query_hidden * ability], dim=-1)
+        return self.response_net(features).squeeze(-1)
+
+
+def build_irt_router(args, query_dim: int, n_models: int) -> nn.Module:
+    if args.irt_router_type == "mirt":
+        return MIRTRouter(
+            query_dim=query_dim,
+            n_models=n_models,
+            latent_dim=args.irt_latent_dim,
+        )
+    if args.irt_router_type == "nirt":
+        return NIRTRouter(
+            query_dim=query_dim,
+            n_models=n_models,
+            hidden_dim=args.irt_hidden_dim,
+            dropout=args.irt_dropout,
+        )
+    raise ValueError(f"Unknown --irt-router-type: {args.irt_router_type}")
+
+
 def train_mirt_router(
     train_embeddings: np.ndarray,
     target_perf: pd.DataFrame,
     model_names: List[str],
     args,
-) -> MIRTRouter:
+) -> nn.Module:
     if len(train_embeddings) == 0:
-        raise ValueError("MIRT-Router requires at least one general training query")
+        raise ValueError("IRT-Router requires at least one general training query")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MIRTRouter(
+    model = build_irt_router(
+        args,
         query_dim=train_embeddings.shape[1],
         n_models=len(model_names),
-        latent_dim=args.irt_latent_dim,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.irt_lr, weight_decay=args.irt_weight_decay)
     loss_fn = nn.BCEWithLogitsLoss()
@@ -430,7 +499,8 @@ def train_mirt_router(
 
         if epoch == 0 or (epoch + 1) % log_every == 0 or epoch + 1 == args.irt_epochs:
             logger.info(
-                "MIRT epoch {}/{} loss {:.6f}",
+                "{} epoch {}/{} loss {:.6f}",
+                args.irt_router_type.upper(),
                 epoch + 1,
                 args.irt_epochs,
                 total_loss / max(1, total_items),
@@ -440,7 +510,7 @@ def train_mirt_router(
 
 
 def predict_mirt_performance(
-    model: MIRTRouter,
+    model: nn.Module,
     embeddings: np.ndarray,
     batch_size: int,
 ) -> np.ndarray:
@@ -483,7 +553,7 @@ def compute_irt_reward_scores(
 def save_irt_router(
     router_path: Path,
     feature_path: Path,
-    model: MIRTRouter,
+    model: nn.Module,
     embedder,
     model_names: List[str],
     fixed_cost_norm: np.ndarray,
@@ -493,8 +563,11 @@ def save_irt_router(
     torch.save(
         {
             "state_dict": model.state_dict(),
+            "router_type": "nirt" if isinstance(model, NIRTRouter) else "mirt",
             "query_dim": model.query_dim,
-            "latent_dim": model.latent_dim,
+            "latent_dim": getattr(model, "latent_dim", None),
+            "hidden_dim": getattr(model, "hidden_dim", None),
+            "dropout": getattr(model, "dropout", None),
             "n_models": model.n_models,
             "model_names": model_names,
             "fixed_cost_norm": fixed_cost_norm.astype(np.float32),
@@ -513,7 +586,7 @@ def load_torch_checkpoint(path: Path):
         return torch.load(path, map_location="cpu")
 
 
-def load_irt_router(router_path: Path, feature_path: Path, model_names: List[str]) -> Tuple[MIRTRouter, object, np.ndarray, np.ndarray]:
+def load_irt_router(router_path: Path, feature_path: Path, model_names: List[str]) -> Tuple[nn.Module, object, np.ndarray, np.ndarray]:
     if not router_path.exists() or not feature_path.exists():
         raise ValueError(
             f"predict-only mode requires saved IRT artifacts: {router_path} and {feature_path}"
@@ -523,11 +596,22 @@ def load_irt_router(router_path: Path, feature_path: Path, model_names: List[str
     if saved_models != model_names:
         raise ValueError(f"IRT artifact model order mismatch: saved={saved_models}, current={model_names}")
 
-    model = MIRTRouter(
-        query_dim=int(checkpoint["query_dim"]),
-        n_models=int(checkpoint["n_models"]),
-        latent_dim=int(checkpoint["latent_dim"]),
-    )
+    router_type = checkpoint.get("router_type", "mirt")
+    if router_type == "mirt":
+        model = MIRTRouter(
+            query_dim=int(checkpoint["query_dim"]),
+            n_models=int(checkpoint["n_models"]),
+            latent_dim=int(checkpoint["latent_dim"]),
+        )
+    elif router_type == "nirt":
+        model = NIRTRouter(
+            query_dim=int(checkpoint["query_dim"]),
+            n_models=int(checkpoint["n_models"]),
+            hidden_dim=int(checkpoint["hidden_dim"]),
+            dropout=float(checkpoint.get("dropout") or 0.0),
+        )
+    else:
+        raise ValueError(f"Unknown IRT router type in artifact: {router_type}")
     model.load_state_dict(checkpoint["state_dict"])
     with open(feature_path, "rb") as f:
         embedder = pickle.load(f)
@@ -552,15 +636,16 @@ def train_or_predict_irt_router(
     router_path, feature_path = irt_artifact_paths(args, out_dir)
     if args.mode == "train-predict":
         logger.info(
-            "Fitting MIRT query embeddings on {} general rows with backend={}",
+            "Fitting {} query embeddings on {} general rows with backend={}",
+            args.irt_router_type.upper(),
             len(train_df),
             args.irt_embedding_backend,
         )
         embedder, train_embeddings = fit_query_embedder(train_df["query"].astype(str).tolist(), args)
         fixed_cost_norm = fixed_model_cost_from_train(train_cost_norm)
         logger.info(
-            "Training MIRT-Router with latent_dim={} and fixed mean model costs",
-            args.irt_latent_dim,
+            "Training {}-Router with fixed mean model costs",
+            args.irt_router_type.upper(),
         )
         model = train_mirt_router(train_embeddings, train_perf, model_names, args)
         save_irt_router(
@@ -1254,12 +1339,28 @@ def main() -> None:
     parser.add_argument("--out", default="submission_starcoder2_qlora.csv")
     parser.add_argument("--output-dir", default="starcoder2_qlora_runs")
     parser.add_argument("--mode", choices=["train-predict", "predict-only"], default="train-predict")
+    parser.add_argument(
+        "--routing-mode",
+        default="hybrid",
+        choices=["hybrid", "direct-reward"],
+        help="hybrid keeps the existing IRT/StarCoder router; direct-reward trains one model on oracle reward.",
+    )
     parser.add_argument("--perf-model", default="withmartian/starcoder2-3b-bcbToppers-perf")
     parser.add_argument("--cost-model", default="withmartian/starcoder2-3b-bcbToppers-cost")
+    parser.add_argument(
+        "--reward-model",
+        default="",
+        help="Base model/checkpoint for --routing-mode direct-reward. Defaults to --perf-model.",
+    )
     parser.add_argument("--coding-perf-model", default="withmartian/starcoder2-3b-bcbToppers-perf")
     parser.add_argument("--coding-cost-model", default="withmartian/starcoder2-3b-bcbToppers-cost")
     parser.add_argument("--perf-adapter", default="")
     parser.add_argument("--cost-adapter", default="")
+    parser.add_argument(
+        "--reward-adapter",
+        default="",
+        help="LoRA adapter path for direct-reward mode. Defaults to <output-dir>/reward_adapter.",
+    )
     parser.add_argument("--coding-perf-adapter", default="")
     parser.add_argument("--coding-cost-adapter", default="")
     parser.add_argument("--alpha", type=float, default=0.85)
@@ -1299,6 +1400,7 @@ def main() -> None:
     parser.add_argument("--tokenize-batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--logging-steps", type=int, default=20)
+    parser.add_argument("--limit", type=int, default=0, help="Optional row limit for quick smoke tests.")
     parser.add_argument("--max-gpu-mem", default="")
     parser.add_argument("--max-cpu-mem", default="48GiB")
     parser.add_argument("--attn-implementation", default="")
@@ -1325,7 +1427,15 @@ def main() -> None:
     )
     parser.add_argument("--min-coding-train-rows", type=int, default=1)
     parser.add_argument("--irt-router-path", default="")
+    parser.add_argument(
+        "--irt-router-type",
+        default="mirt",
+        choices=["mirt", "nirt"],
+        help="Router head for non-coding/general rows.",
+    )
     parser.add_argument("--irt-latent-dim", type=int, default=25)
+    parser.add_argument("--irt-hidden-dim", type=int, default=128)
+    parser.add_argument("--irt-dropout", type=float, default=0.10)
     parser.add_argument("--irt-query-dim", type=int, default=256)
     parser.add_argument("--irt-epochs", type=int, default=80)
     parser.add_argument("--irt-batch-size", type=int, default=512)
@@ -1339,7 +1449,7 @@ def main() -> None:
         "--irt-embedding-backend",
         default="sentence-transformer",
         choices=["sentence-transformer", "tfidf"],
-        help="Query embedding backend for MIRT-Router.",
+        help="Query embedding backend for the IRT router.",
     )
     parser.add_argument(
         "--irt-embedding-model",
@@ -1354,6 +1464,8 @@ def main() -> None:
     )
     parser.add_argument("--irt-e5-query-prefix", action="store_true", default=True)
     parser.add_argument("--no-irt-e5-query-prefix", dest="irt_e5_query_prefix", action="store_false")
+    parser.add_argument("--irt-bge-query-prefix", action="store_true", default=True)
+    parser.add_argument("--no-irt-bge-query-prefix", dest="irt_bge_query_prefix", action="store_false")
     parser.add_argument("--irt-tfidf-analyzer", default="char_wb", choices=["word", "char", "char_wb"])
     parser.add_argument("--irt-tfidf-ngram-min", type=int, default=3)
     parser.add_argument("--irt-tfidf-ngram-max", type=int, default=5)
@@ -1379,6 +1491,10 @@ def main() -> None:
 
     if args.irt_embedding_backend == "tfidf" and args.irt_tfidf_ngram_min > args.irt_tfidf_ngram_max:
         raise ValueError("--irt-tfidf-ngram-min must be <= --irt-tfidf-ngram-max")
+    if args.irt_hidden_dim <= 0:
+        raise ValueError("--irt-hidden-dim must be positive")
+    if not 0.0 <= args.irt_dropout < 1.0:
+        raise ValueError("--irt-dropout must be in [0, 1)")
     if args.irt_st_batch_size <= 0:
         raise ValueError("--irt-st-batch-size must be positive")
     if not 0.0 <= args.irt_warmup_lambda <= 1.0:
@@ -1398,6 +1514,10 @@ def main() -> None:
 
     logger.info("Loading dataset")
     train_df, test_df = load_data(args.train, args.test)
+    if args.limit > 0:
+        logger.warning("Applying smoke-test row limit: first {} train/test rows", args.limit)
+        train_df = train_df.head(args.limit).copy()
+        test_df = test_df.head(args.limit).copy()
     model_names = parse_model_names(train_df.columns.tolist())
     perf, cost = extract_perf_cost(train_df, model_names)
 
@@ -1422,6 +1542,89 @@ def main() -> None:
     cost_train = cost_norm.iloc[train_idx].reset_index(drop=True)
     perf_val = perf.iloc[val_idx].reset_index(drop=True) if len(val_idx) else None
     cost_val = cost_norm.iloc[val_idx].reset_index(drop=True) if len(val_idx) else None
+
+    if args.routing_mode == "direct-reward":
+        reward_model = args.reward_model or args.perf_model
+        reward_adapter = args.reward_adapter or str(out_dir / "reward_adapter")
+        reward_train = oracle_reward.iloc[train_idx].reset_index(drop=True)
+        reward_val = oracle_reward.iloc[val_idx].reset_index(drop=True) if len(val_idx) else None
+
+        logger.info(
+            "Training/predicting direct reward router with model={}, adapter={}",
+            reward_model,
+            reward_adapter,
+        )
+        reward_val_pred, reward_test_scores = train_or_predict_one_target(
+            target_name="reward",
+            model_name=reward_model,
+            adapter_path=reward_adapter,
+            output_dir=out_dir,
+            train_df=train_part,
+            val_df=val_part,
+            test_df=test_df,
+            train_target=reward_train,
+            val_target=reward_val,
+            models=model_names,
+            args=args,
+            hf_token=hf_token,
+            direct_model=False,
+        )
+
+        if reward_val_pred is not None and len(val_idx):
+            val_preds = models_from_scores(reward_val_pred, model_names)
+            val_perf_raw = perf.iloc[val_idx].reset_index(drop=True)
+            val_cost_raw = cost.iloc[val_idx].reset_index(drop=True)
+            val_reward = evaluate_policy_reward(val_perf_raw, val_cost_raw, val_preds, cfg)
+            val_oracle = evaluate_policy_reward(
+                val_perf_raw,
+                val_cost_raw,
+                labels_from_reward(compute_reward(val_perf_raw, val_cost_raw, cfg)).tolist(),
+                cfg,
+            )
+            logger.info("Validation direct-reward router reward: {:.6f}", val_reward)
+            logger.info("Validation oracle reward: {:.6f}", val_oracle)
+            if args.save_val_reward_scores:
+                save_reward_scores(
+                    args.save_val_reward_scores,
+                    train_df.iloc[val_idx]["ID"].reset_index(drop=True),
+                    model_names,
+                    reward_val_pred,
+                )
+                logger.info("Saved validation direct reward scores to {}", args.save_val_reward_scores)
+            if args.save_score_debug:
+                save_score_debug(
+                    out_dir,
+                    "val",
+                    train_df.iloc[val_idx]["ID"].reset_index(drop=True),
+                    model_names,
+                    reward_val_pred,
+                    np.zeros_like(reward_val_pred, dtype=np.float32),
+                    val_preds,
+                    task_profiles=val_profiles,
+                    router_sources=np.full(len(val_part), "direct_reward", dtype=object),
+                )
+
+        test_preds = models_from_scores(reward_test_scores, model_names)
+        make_submission(test_df, test_preds, args.out)
+        logger.info("Saved direct-reward submission to {}", args.out)
+
+        if args.save_reward_scores:
+            save_reward_scores(args.save_reward_scores, test_df["ID"], model_names, reward_test_scores)
+            logger.info("Saved test direct reward scores to {}", args.save_reward_scores)
+
+        if args.save_score_debug:
+            save_score_debug(
+                out_dir,
+                "test",
+                test_df["ID"],
+                model_names,
+                reward_test_scores,
+                np.zeros_like(reward_test_scores, dtype=np.float32),
+                test_preds,
+                task_profiles=test_profiles,
+                router_sources=np.full(len(test_df), "direct_reward", dtype=object),
+            )
+        return
 
     coding_perf_adapter = args.coding_perf_adapter or str(out_dir / "coding_perf_adapter")
     coding_cost_adapter = args.coding_cost_adapter or str(out_dir / "coding_cost_adapter")
@@ -1489,7 +1692,7 @@ def main() -> None:
     if general_eval_needed:
         general_train_count = int(general_train_mask.sum())
         if general_train_count == 0:
-            logger.warning("Skipping MIRT-Router because no non-coding/general training rows were found")
+            logger.warning("Skipping IRT-Router because no non-coding/general training rows were found")
         else:
             general_train_part = train_part.loc[general_train_mask].reset_index(drop=True)
             general_perf_train = perf_train.loc[general_train_mask].reset_index(drop=True)
@@ -1524,7 +1727,7 @@ def main() -> None:
                     irt_fixed_cost_norm[None, :],
                     (int(test_general_mask.sum()), 1),
                 )
-                test_sources[test_general_mask] = "general_mirt"
+                test_sources[test_general_mask] = f"general_{args.irt_router_type}"
 
             if (
                 val_reward_scores is not None
@@ -1545,7 +1748,7 @@ def main() -> None:
                     irt_fixed_cost_norm[None, :],
                     (int(val_general_mask.sum()), 1),
                 )
-                val_sources[val_general_mask] = "general_mirt"
+                val_sources[val_general_mask] = f"general_{args.irt_router_type}"
 
     coding_specialist_available = args.coding_specialist
     if args.mode == "predict-only" and args.coding_specialist and not use_coding_direct_model:

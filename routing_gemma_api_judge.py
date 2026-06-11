@@ -26,7 +26,7 @@ if hasattr(sys.stderr, "reconfigure"):
 @dataclass
 class RewardConfig:
     alpha: float = 0.85
-    cost_norm: str = "row-max"  # row-max|minmax-global|minmax-per-model|zscore-global|none
+    cost_norm: str = "global-max"
 
 
 @dataclass
@@ -59,6 +59,9 @@ def parse_model_names(columns: List[str]) -> List[str]:
 
 
 def normalize_cost(cost: pd.DataFrame, method: str) -> pd.DataFrame:
+    if method == "global-max":
+        denom = float(cost.max().max())
+        return cost / (denom if denom > 0 else 1.0)
     if method == "row-max":
         row_max = cost.max(axis=1).replace(0, 1.0)
         return cost.div(row_max, axis=0)
@@ -694,8 +697,8 @@ def main() -> None:
     parser.add_argument("--alpha", type=float, default=0.85)
     parser.add_argument(
         "--cost-norm",
-        default="row-max",
-        choices=["row-max", "none", "minmax-global", "minmax-per-model", "zscore-global"],
+        default="global-max",
+        choices=["global-max", "row-max", "none", "minmax-global", "minmax-per-model", "zscore-global"],
     )
     args = parser.parse_args()
 

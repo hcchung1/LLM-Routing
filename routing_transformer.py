@@ -22,7 +22,7 @@ from transformers import (
 @dataclass
 class RewardConfig:
     alpha: float = 0.85
-    cost_norm: str = "row-max"  # row-max|minmax-global|minmax-per-model|zscore-global|none
+    cost_norm: str = "global-max"
 
 
 def parse_model_names(columns: List[str]) -> List[str]:
@@ -34,6 +34,9 @@ def parse_model_names(columns: List[str]) -> List[str]:
 
 
 def normalize_cost(cost: pd.DataFrame, method: str) -> pd.DataFrame:
+    if method == "global-max":
+        denom = float(cost.max().max())
+        return cost / (denom if denom > 0 else 1.0)
     if method == "row-max":
         row_max = cost.max(axis=1).replace(0, 1.0)
         return cost.div(row_max, axis=0)
@@ -57,7 +60,7 @@ def normalize_cost(cost: pd.DataFrame, method: str) -> pd.DataFrame:
 
 
 def compute_reward(perf: pd.DataFrame, cost: pd.DataFrame, cfg: RewardConfig) -> pd.DataFrame:
-    # Reward_{0.85} = 0.85 * P - 0.15 * (C / C_max) per sample.
+    # Kaggle Reward_alpha uses the global maximum cost as the cost denominator.
     cost_n = normalize_cost(cost, cfg.cost_norm)
     alpha = cfg.alpha
     return alpha * perf - (1.0 - alpha) * cost_n
@@ -126,8 +129,8 @@ def main() -> None:
     parser.add_argument("--alpha", type=float, default=0.85)
     parser.add_argument(
         "--cost-norm",
-        default="row-max",
-        choices=["row-max", "none", "minmax-global", "minmax-per-model", "zscore-global"],
+        default="global-max",
+        choices=["global-max", "row-max", "none", "minmax-global", "minmax-per-model", "zscore-global"],
     )
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument(
