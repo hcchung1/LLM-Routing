@@ -218,3 +218,14 @@ __marimo__/
 .streamlit/secrets.toml
 transformer_runs/
 output/
+output*
+
+*submission*
+*.sh
+*.csv
+AGENTS.md
+*.jsonl
+*.json
+*.npz
+*.txt
+*.npy
