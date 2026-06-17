@@ -218,3 +218,4 @@ __marimo__/
 .streamlit/secrets.toml
 transformer_runs/
 output/
+output_G/

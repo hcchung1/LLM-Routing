@@ -1138,7 +1138,13 @@ def run_train_soft_oracle(args: argparse.Namespace) -> None:
     cost_denominator = compute_cost_denominator(cost, args.cost_denominator)
     true_reward = compute_true_reward(performance, cost, cost_denominator)
     soft_targets = softmax_numpy(true_reward, args.soft_label_temperature)
-    row_weights = regret_gap_weights(true_reward)
+    gap = regret_gap_weights(true_reward)
+    scale = float(np.quantile(gap, 0.9))
+    if scale <= 1e-12:
+        row_weights = np.ones_like(gap, dtype=np.float32)
+    else:
+        row_weights = 0.10 + 0.90 * np.clip(gap / scale, 0.0, 1.0)
+    row_weights = row_weights.astype(np.float32)
     targets = pack_soft_oracle_labels(soft_targets, true_reward, row_weights)
     train_idx, val_idx = split_indices(len(train_df), args.val_size, args.seed)
 
