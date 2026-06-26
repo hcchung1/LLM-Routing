@@ -178,6 +178,19 @@ def parse_args() -> argparse.Namespace:
     calibrate_parser.add_argument("--embedding-batch-size", type=int, default=32)
     calibrate_parser.add_argument("--knn-k", type=int, default=50)
 
+    calibrate_soft_oracle_bias_parser = subparsers.add_parser(
+        "calibrate-soft-oracle-bias",
+        help="Calibrate soft-oracle model bias using validation audit and test scores.",
+    )
+    calibrate_soft_oracle_bias_parser.add_argument("--audit", required=True, help="Path to validation audit npz file")
+    calibrate_soft_oracle_bias_parser.add_argument("--test-score", required=True, help="Path to test scores npz file")
+    calibrate_soft_oracle_bias_parser.add_argument("--sample", required=True, help="Path to sample submission CSV")
+    calibrate_soft_oracle_bias_parser.add_argument("--out-json", default="soft_oracle_bias.json", help="Output JSON file path")
+    calibrate_soft_oracle_bias_parser.add_argument("--out-csv", default="submission_soft_oracle_bias_cal.csv", help="Output submission CSV path")
+    calibrate_soft_oracle_bias_parser.add_argument("--step", type=float, default=0.02, help="Initial search step size")
+    calibrate_soft_oracle_bias_parser.add_argument("--shrink", type=float, default=0.7, help="Shrink factor to avoid overfitting")
+    calibrate_soft_oracle_bias_parser.add_argument("--enable", action="store_true", default=False, help="Enable bias calibration (default: false)")
+
     list_parser = subparsers.add_parser("list-profiles", help="Print built-in hardware profiles.")
     list_parser.set_defaults(profile="")
 
@@ -1674,6 +1687,125 @@ def run_predict_soft_oracle(args: argparse.Namespace) -> None:
     print(f"Saved soft-oracle submission to {args.out}")
 
 
+def run_calibrate_soft_oracle_bias(args: argparse.Namespace) -> None:
+    """
+    Calibrate soft-oracle model bias using coordinate search.
+    Loads validation audit and test scores, finds optimal bias adjustment,
+    and saves calibrated submission.
+    """
+    if not args.enable:
+        print("Bias calibration is disabled (--enable flag not set). Skipping...")
+        return
+
+    audit_path = Path(args.audit)
+    test_score_path = Path(args.test_score)
+    sample_path = Path(args.sample)
+    out_json_path = Path(args.out_json)
+    out_csv_path = Path(args.out_csv)
+
+    # Load validation audit data
+    print(f"Loading audit from {audit_path}...")
+    audit = np.load(audit_path, allow_pickle=True)
+    val_logits = audit["logits"].astype(np.float32)
+    true_reward = audit["true_reward"].astype(np.float32)
+    model_names = [str(x) for x in audit["model_names"]]
+
+    # Load test scores
+    print(f"Loading test scores from {test_score_path}...")
+    test = np.load(test_score_path, allow_pickle=True)
+    test_logits = test["logits"].astype(np.float32)
+    
+    # Load sample submission
+    print(f"Loading sample from {sample_path}...")
+    sample = pd.read_csv(sample_path)
+
+    # Define scoring function with bias
+    def score_with_bias(bias):
+        pred = (val_logits + bias[None, :]).argmax(axis=1)
+        rows = np.arange(len(pred))
+        return float(true_reward[rows, pred].mean())
+
+    # Initialize bias
+    bias = np.zeros(val_logits.shape[1], dtype=np.float32)
+    best = score_with_bias(bias)
+    print(f"Initial validation reward: {best:.6f}")
+
+    # Coarse-to-fine coordinate search
+    search_params = [
+        (0.10, 1.5, 3),  # (step, radius, passes)
+        (0.05, 0.5, 3),
+        (args.step, 0.2, 2),  # Final pass with user-specified step
+    ]
+    
+    for step, radius, passes in search_params:
+        print(f"Searching with step={step}, radius={radius}, passes={passes}...")
+        grid = np.arange(-radius, radius + 1e-9, step, dtype=np.float32)
+        
+        for pass_num in range(passes):
+            improved = False
+            for j in range(len(bias)):
+                current = bias[j]
+                local_best = best
+                local_value = current
+                
+                for delta in grid:
+                    trial = bias.copy()
+                    trial[j] = current + delta
+                    s = score_with_bias(trial)
+                    if s > local_best:
+                        local_best = s
+                        local_value = trial[j]
+                
+                if local_best > best:
+                    bias[j] = local_value
+                    best = local_best
+                    improved = True
+            
+            if not improved:
+                break
+
+    # Shrink bias to avoid overfitting on validation data
+    original_bias = bias.copy()
+    bias = bias * args.shrink
+    final_val_score = score_with_bias(bias)
+    
+    print(f"Before shrinking: {best:.6f}")
+    print(f"After shrinking (factor={args.shrink}): {final_val_score:.6f}")
+    print(f"Calibrated biases: {dict(zip(model_names, bias.tolist()))}")
+
+    # Save calibration results
+    out_json_path.parent.mkdir(parents=True, exist_ok=True)
+    calibration_data = {
+        "model_names": model_names,
+        "bias": bias.tolist(),
+        "original_bias": original_bias.tolist(),
+        "shrink": args.shrink,
+        "validation_reward_before": best,
+        "validation_reward_after": final_val_score,
+    }
+    out_json_path.write_text(
+        json.dumps(calibration_data, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Saved calibration to {out_json_path}")
+
+    # Generate calibrated predictions
+    pred_idx = (test_logits + bias[None, :]).argmax(axis=1)
+    pred_model = [model_names[i] for i in pred_idx]
+
+    # Save submission
+    submission = pd.DataFrame({
+        "ID": sample["ID"],
+        "pred_model": pred_model,
+    })
+    out_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    submission.to_csv(out_csv_path, index=False)
+    
+    print(f"\nPrediction distribution:")
+    print(submission["pred_model"].value_counts().sort_index())
+    print(f"Saved calibrated submission to {out_csv_path}")
+
+
 def main() -> None:
     args = parse_args()
     if args.command == "list-profiles":
@@ -1688,6 +1820,8 @@ def main() -> None:
         run_predict_soft_oracle(args)
     elif args.command == "calibrate":
         run_calibrate(args)
+    elif args.command == "calibrate-soft-oracle-bias":
+        run_calibrate_soft_oracle_bias(args)
     else:
         raise ValueError(f"Unknown command: {args.command}")
 
