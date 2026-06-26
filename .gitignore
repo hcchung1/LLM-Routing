@@ -230,3 +230,4 @@ AGENTS.md
 *.npz
 *.txt
 *.npy
+output_G/
