@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from carrot_router import (
+from tests.carrot_router import (
     compute_cost_denominator,
     load_metadata,
     load_soft_oracle_metadata,

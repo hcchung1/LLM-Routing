@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from routing_tfidf_knn_router import (
+from tests.routing_tfidf_knn_router import (
     compute_reward,
     find_text_column,
     parse_model_names,
